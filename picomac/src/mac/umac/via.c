@@ -31,6 +31,7 @@
 #include <stdint.h>
 
 #include "via.h"
+#include "state.h"
 
 #ifdef DEBUG
 #define VDBG(...)       printf(__VA_ARGS__)
@@ -82,6 +83,12 @@ static const char *dbg_regnames[] = {
 };
 
 static uint8_t via_regs[16];
+
+/* pico-mac: a register as stored, for debugging (no side effects) */
+uint8_t via_peek(int reg)
+{
+        return via_regs[reg & 15];
+}
 static struct via_cb via_callbacks;
 static int irq_status = 0;
 static uint8_t irq_active = 0;
@@ -456,4 +463,17 @@ void    via_sr_rx(uint8_t val)
         } else {
                 VDBG("[VIA ACR SR state %02x, not receiving]\n", via_regs[VIA_ACR]);
         }
+}
+
+/* pico-mac: snapshots (state.h). The callbacks stay as via_init set them. */
+void    via_state(umac_state_t *s)
+{
+        umac_st(s, via_regs, sizeof(via_regs));
+        UMAC_ST(s, irq_status);
+        UMAC_ST(s, irq_active);
+        UMAC_ST(s, irq_enable);
+        UMAC_ST(s, t1_latch); UMAC_ST(s, t2_latch); UMAC_ST(s, t1_n); UMAC_ST(s, t2_n);
+        UMAC_ST(s, t1_base); UMAC_ST(s, t2_base); UMAC_ST(s, t1_next); UMAC_ST(s, t2_next);
+        UMAC_ST(s, t1_armed); UMAC_ST(s, t2_armed);
+        UMAC_ST(s, sr_tx_pending);
 }

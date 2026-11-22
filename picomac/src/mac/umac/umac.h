@@ -50,6 +50,12 @@ int     umac_run(uint32_t cycles);
 /* VIA timers count at the CPU clock / (10 * this): 2 runs the CPU twice as fast against them. */
 void    umac_set_speed(int mult);
 void    umac_reset(void);
+/* Snapshots, between umac_run calls: io moves n bytes to the stream (save) or from it (load),
+ * nonzero = failed. A load goes into a machine umac_init started with the same RAM size, screen
+ * size, ROM and disks. 0 = done, -1 = I/O error (after a failed load the machine is unusable),
+ * -2 = not a state for this machine (nothing was changed). */
+int     umac_save_state(int (*io)(void *ctx, void *p, unsigned int n), void *ctx);
+int     umac_load_state(int (*io)(void *ctx, void *p, unsigned int n), void *ctx);
 void    umac_opt_disassemble(int enable);
 void    umac_mouse(int deltax, int deltay, int button);
 /* scancode: the Mac key code (keymap.h MKC_*), not yet shifted into the keyboard protocol */
@@ -68,6 +74,16 @@ int     umac_rtc_pram_dirty(void);      /* 1 when the Mac wrote PRAM since the l
 const uint8_t *umac_sound_buffer(void); /* word i's sample is [2 * i] */
 int     umac_sound_enabled(void);
 int     umac_sound_volume(void);        /* 0..7 */
+int     umac_sound_first_write(void);   /* first buffer word written since the reset, or -1 */
+void    umac_sound_mark_reset(void);
+/* Debugging (pico-mac): PCs after each umac_run slice go to buf (up to n); the registers as
+ * text. */
+void    umac_pc_sample(uint32_t *buf, int n);
+int     umac_pc_sampled(void);
+int     umac_dump_regs(char *buf, int len);
+/* Times umac_run cut a loop out of the VBL queue (see vbl_queue_repair in main.c). */
+int     umac_vbl_fixes(void);
+uint8_t via_peek(int reg);
 
 void    umac_1hz_event(void);
 

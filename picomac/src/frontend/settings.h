@@ -19,6 +19,8 @@ struct Settings {
   int screen = SCREEN_FIT;
   int speed = 1;             // CPU speed multiplier: 1 = a real Mac Plus, up to 4
   std::string disk;          // the boot disk image (full path), "" = none yet
+  std::string disk2;         // a second disk (drive 2), "" = none
+  int arrows = 1;            // what the arrows do: 0 Mac arrow keys, 1 the pointer, 2 both
 };
 
 extern Settings g_settings;

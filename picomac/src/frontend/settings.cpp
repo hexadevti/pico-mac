@@ -56,12 +56,15 @@ void settingsLoad() {
     else if (!strcmp(line, "screen"))    g_settings.screen = atoi(v);
     else if (!strcmp(line, "speed"))     g_settings.speed = atoi(v);
     else if (!strcmp(line, "disk"))     g_settings.disk = v;
+    else if (!strcmp(line, "disk2"))    g_settings.disk2 = v;
+    else if (!strcmp(line, "arrows"))   g_settings.arrows = atoi(v);
   }
   fclose(f);
   if (g_settings.volume < 0 || g_settings.volume > 10) g_settings.volume = 7;
   if (g_settings.ram < 0 || g_settings.ram >= RAM_COUNT) g_settings.ram = RAM_4M;
   if (g_settings.screen < 0 || g_settings.screen >= SCREEN_COUNT) g_settings.screen = SCREEN_FIT;
   if (g_settings.speed < 1 || g_settings.speed > 4) g_settings.speed = 1;
+  if (g_settings.arrows < 0 || g_settings.arrows > 2) g_settings.arrows = 1;
   while (!g_settings.romPath.empty() && g_settings.romPath[0] == '/') g_settings.romPath.erase(0, 1);
 }
 
@@ -69,9 +72,9 @@ void settingsSave() {
   makeDirs(sdPath("picomac"));
   FILE *f = fopen(cfgPath().c_str(), "w");
   if (!f) { hal_log("settings: cannot write %s", cfgPath().c_str()); return; }
-  fprintf(f, "volume=%d\nshowfps=%d\nlastdir=%s\nrom=%s\nram=%d\nscreen=%d\nspeed=%d\ndisk=%s\n",
+  fprintf(f, "volume=%d\nshowfps=%d\nlastdir=%s\nrom=%s\nram=%d\nscreen=%d\nspeed=%d\ndisk=%s\ndisk2=%s\narrows=%d\n",
           g_settings.volume, g_settings.showFps ? 1 : 0, g_settings.lastDir.c_str(),
           g_settings.romPath.c_str(), g_settings.ram, g_settings.screen, g_settings.speed,
-          g_settings.disk.c_str());
+          g_settings.disk.c_str(), g_settings.disk2.c_str(), g_settings.arrows);
   fclose(f);
 }

@@ -66,10 +66,12 @@ void hal_reboot_to_loader() {
 //   @keys <script>   type a MAC_KEYS script (keyscript.h); "@keys done" when it has run
 //   @shot            the screen, as "@S" rows (p4Shot)
 //   @prof, @profdump the sampling profiler (prof_p4.cpp)
+//   anything else    the core's (hal_serial_cmd): pico-mac's "@mac" dumps the 68000
 void p4RemoteKeys(const char *script);   // input_p4.cpp
 void p4Shot();                           // display_p4.cpp
 void p4ProfStart(const char *args);      // prof_p4.cpp
 void p4ProfDump();
+void (*hal_serial_cmd)(const char *line) = nullptr;
 
 static void serialCommand(char *line) {
   if (!strcmp(line, "@uf2menu")) hal_reboot_to_loader();
@@ -77,6 +79,7 @@ static void serialCommand(char *line) {
   else if (!strcmp(line, "@shot")) p4Shot();
   else if (!strncmp(line, "@prof ", 6)) p4ProfStart(line + 6);
   else if (!strcmp(line, "@profdump")) p4ProfDump();
+  else if (hal_serial_cmd) hal_serial_cmd(line);
 }
 
 void p4CheckSerialCmd() {

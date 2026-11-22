@@ -28,6 +28,7 @@
 #include <inttypes.h>
 
 #include "scc.h"
+#include "state.h"
 
 #ifdef DEBUG
 #define SDBG(...)       printf(__VA_ARGS__)
@@ -335,3 +336,19 @@ uint8_t scc_read(unsigned int address)
         return data;
 }
 
+
+/* pico-mac: snapshots (state.h). The callbacks stay as scc_init set them. */
+void    scc_state(umac_state_t *s)
+{
+        UMAC_ST(s, scc_reg_ptr);
+        UMAC_ST(s, scc_mie);
+        UMAC_ST(s, scc_read_acks);
+        UMAC_ST(s, scc_status_hi);
+        umac_st(s, scc_ie, sizeof(scc_ie));
+        UMAC_ST(s, scc_irq_pending);
+        UMAC_ST(s, scc_vec);
+        UMAC_ST(s, scc_irq);
+        UMAC_ST(s, scc_dcd_pins);
+        UMAC_ST(s, scc_dcd_a_changed);
+        UMAC_ST(s, scc_dcd_b_changed);
+}

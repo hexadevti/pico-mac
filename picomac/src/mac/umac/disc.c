@@ -13,6 +13,7 @@
 #include <stdlib.h>
 
 #include "disc.h"
+#include "state.h"
 #include "m68k.h"
 #include "machw.h"
 
@@ -27,7 +28,7 @@
 extern void umac_disc_ejected(void);
 
 // B2 decls:
-static int16_t SonyOpen(uint32_t pb, uint32_t dce, uint32_t status);
+static int16_t SonyOpen(uint32_t pb, uint32_t dce, uint32_t status, uint32_t index);
 static int16_t SonyPrime(uint32_t pb, uint32_t dce);
 static int16_t SonyControl(uint32_t pb, uint32_t dce);
 static int16_t SonyStatus(uint32_t pb, uint32_t dce);
@@ -47,12 +48,13 @@ int     disc_pv_hook(uint8_t opcode)
         uint32_t a0 = m68k_get_reg(NULL, M68K_REG_A0);
         uint32_t a1 = m68k_get_reg(NULL, M68K_REG_A1);
         uint32_t a2 = m68k_get_reg(NULL, M68K_REG_A2);
+        uint32_t d1 = m68k_get_reg(NULL, M68K_REG_D1);  /* pico-mac: Open's drive index */
         uint32_t d0 = 0;
 
         switch(opcode) {
         case 0: // Open
                 DDBG("[Disc: OPEN]\n");
-                d0 = SonyOpen(ADR24(a0), ADR24(a1), ADR24(a2));
+                d0 = SonyOpen(ADR24(a0), ADR24(a1), ADR24(a2), d1);
                 break;
         case 1: // Prime
                 DDBG("[Disc: PRIME]\n");
@@ -151,7 +153,7 @@ static sony_drinfo_t drives[DISC_NUM_DRIVES];
 static sony_drinfo_t *get_drive_info(int num)
 {
         for (int i = 0; i < DISC_NUM_DRIVES; i++) {
-                if (drives[i].num == num)
+                if (drives[i].status && drives[i].num == num)   /* pico-mac: installed drives only */
                         return &drives[i];
         }
         return 0;
@@ -163,15 +165,18 @@ static sony_drinfo_t *get_drive_info(int num)
 
 void SonyInit(disc_descr_t discs[DISC_NUM_DRIVES])
 {
-        drives[0].num = 0;
-        drives[0].to_be_mounted = discs[0].size != 0;   /* pico-mac: no image, no disc */
-        drives[0].read_only = discs[0].read_only;
-        drives[0].data = discs[0].base;
-        drives[0].size = discs[0].size;
-        drives[0].op_ctx = discs[0].op_ctx;
-        drives[0].op_read = discs[0].op_read;
-        drives[0].op_write = discs[0].op_write;
-        // FIXME: Disc 2
+        /* pico-mac: every drive (was drive 0 only); Open installs them */
+        for (int i = 0; i < DISC_NUM_DRIVES; i++) {
+                drives[i].num = 0;
+                drives[i].status = 0;
+                drives[i].to_be_mounted = 0;
+                drives[i].read_only = discs[i].read_only;
+                drives[i].data = discs[i].base;
+                drives[i].size = discs[i].size;
+                drives[i].op_ctx = discs[i].op_ctx;
+                drives[i].op_read = discs[i].op_read;
+                drives[i].op_write = discs[i].op_write;
+        }
 }
 
 /*
@@ -212,28 +217,35 @@ const int SonyRefNum = -5;                              // RefNum of driver
 
 /*
  *  Driver Open() routine
+ *
+ *  pico-mac: the 68K stub calls this once per drive index (d1 = 0, 1, ...) with a new status
+ *  record each time, and AddDrive()s the drive number returned; 0 = no more drives. Drive 0
+ *  is always installed (it is the boot drive, with or without a disc); the others only when
+ *  they have an image, and they are mounted later, by accRun.
  */
-int16_t SonyOpen(uint32_t pb, uint32_t dce, uint32_t status)
+int16_t SonyOpen(uint32_t pb, uint32_t dce, uint32_t status, uint32_t index)
 {
-	DDBG("SonyOpen\n");
+	DDBG("SonyOpen %d\n", index);
 
-	// Set up DCE
-	WriteMacInt32(dce + dCtlPosition, 0);
-	WriteMacInt16(dce + dCtlQHdr + qFlags, (ReadMacInt16(dce + dCtlQHdr + qFlags) & 0xff00) | 3);	// Version number, must be >=3 or System 8 will replace us
+        if (index >= DISC_NUM_DRIVES)
+                return 0;
+        sony_drinfo_t *info = &drives[index];
+        if (index > 0 && info->size == 0)
+                return 0;
 
-	// Set up fake SonyVars
-	WriteMacInt32(0x134, 0xdeadbeef);
+        if (index == 0) {
+                // Set up DCE
+                WriteMacInt32(dce + dCtlPosition, 0);
+                WriteMacInt16(dce + dCtlQHdr + qFlags, (ReadMacInt16(dce + dCtlQHdr + qFlags) & 0xff00) | 3);	// Version number, must be >=3 or System 8 will replace us
 
-	// Clear DskErr
-	set_dsk_err(0);
+                // Set up fake SonyVars
+                WriteMacInt32(0x134, 0xdeadbeef);
 
-	// Install drives
-        //for (int drnum = 0; drnum < NUM_DRIVES; drnum++) {
-        const int drnum = 0;
-        sony_drinfo_t *info = &drives[drnum];
+                // Clear DskErr
+                set_dsk_err(0);
+        }
 
-        info->num = FindFreeDriveNumber(1); // ? 1 for internal, 2 for external
-        info->to_be_mounted = 0;
+        info->num = FindFreeDriveNumber(1); // 1 for internal, 2 for external
 
         // Original code allocated drive status record here (invoked
         // trap to NewPtrSysClear), but our driver does this instead
@@ -248,23 +260,18 @@ int16_t SonyOpen(uint32_t pb, uint32_t dce, uint32_t status)
         WriteMacInt8(info->status + dsInstalled, 1);
         WriteMacInt8(info->status + dsSides, 0xff); // 2 sides
         WriteMacInt8(info->status + dsTwoSideFmt, 0xff); //
-        //WriteMacInt8(info->status + dsNewIntf, 0xff);
         WriteMacInt8(info->status + dsMFMDrive, 0);	// 0 = 400/800K GCR drive)
         WriteMacInt8(info->status + dsMFMDisk, 0);
-        //WriteMacInt8(info->status + dsTwoMegFmt, 0xff);	// 1.44MB (0 = 720K)
 
         // If disk in drive...
-        WriteMacInt8(info->status + dsDiskInPlace, 1);	// Inserted removable disk
+        WriteMacInt8(info->status + dsDiskInPlace, info->size ? 1 : 0);	// Inserted removable disk
         WriteMacInt8(info->status + dsWriteProt, info->read_only ? 0xff : 0);
-        DDBG(" disk inserted, flagging for mount\n");
-        info->to_be_mounted = 1;
+        info->to_be_mounted = index > 0;	// the boot drive is mounted by the boot
 
-        // Original code ddded drive to drive queue here (invoked trap
-        // to AddDrive), but our driver does this after this PV call returns.
-        // FIXME: In future return a bitmap of drives to add.
+        // The 68K stub adds the drive to the drive queue (AddDrive) after this returns.
         (void)pb;
 
-        return noErr;
+        return info->num;
 }
 
 
@@ -374,14 +381,16 @@ int16_t SonyControl(uint32_t pb, uint32_t dce)
 			return set_dsk_err(noErr);
 
                 case 65: {	// Periodic action (accRun, "insert" disks on startup)
-                        static int complained_yet = 0;
-                        if (!complained_yet) {
-                                DERR("SonyControl:accRun: Not supported!\n");
-                                complained_yet = 1;
+                        // pico-mac: like Basilisk's mount_mountable_volumes. A drive number
+                        // returned here makes the 68K stub PostEvent(diskEvt, drive), and
+                        // GetNextEvent then mounts the volume.
+                        for (int i = 0; i < DISC_NUM_DRIVES; i++) {
+                                if (drives[i].status && drives[i].to_be_mounted) {
+                                        drives[i].to_be_mounted = 0;
+                                        return drives[i].num;
+                                }
                         }
-                        // The original emulation code hooked this to mount_mountable_volumes,
-                        // which called back to PostEvent(diskEvent).
-			return set_dsk_err(-1);
+			return set_dsk_err(noErr);
                 }
 	}
 
@@ -538,4 +547,15 @@ int16_t SonyStatus(uint32_t pb, uint32_t dce)
         (void)dce;
 
 	return set_dsk_err(err);
+}
+
+/* pico-mac: snapshots (state.h). What the Mac knows of each drive; the image and its callbacks
+ * stay as disc_init set them (the same disks are opened before a load). */
+void    disc_state(umac_state_t *s)
+{
+        for (int i = 0; i < DISC_NUM_DRIVES; i++) {
+                UMAC_ST(s, drives[i].num);
+                UMAC_ST(s, drives[i].to_be_mounted);
+                UMAC_ST(s, drives[i].status);
+        }
 }

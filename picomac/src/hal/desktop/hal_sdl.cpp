@@ -46,6 +46,8 @@ uint32_t hal_micros() {
 }
 void hal_delay(uint32_t ms) { hal_yield(); SDL_Delay(ms); }
 
+void (*hal_serial_cmd)(const char *line) = nullptr;
+
 void hal_log(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
@@ -164,7 +166,7 @@ void hal_yield() {
 }
 
 // Test hook: MAC_KEYS is a KeyScript (keyscript.h) run once the queue is empty. Besides keys and
-// waits: "shot" saves <sd>/shotN.bmp; "quit" exits.
+// waits: "shot" saves <sd>/shotN.bmp; "dump" is the console's "@mac"; "quit" exits.
 static void scriptStep() {
   static KeyScript ks;
   static bool started = false;
@@ -191,6 +193,7 @@ static void scriptStep() {
   char t[32];
   if (!ks.step(hal_millis(), s_qHead == s_qTail, qPush, t, sizeof(t))) return;
   if (!strcmp(t, "quit")) exit(0);
+  if (!strcmp(t, "dump") && hal_serial_cmd) hal_serial_cmd("@mac");
   if (!strcmp(t, "shot")) { char n[32]; snprintf(n, sizeof(n), "shot%d.bmp", ++shots); saveShot(n); }
   // bigshot: the Mac's whole screen, which the panel may scale or pan
   int bw = 0, bh = 0;

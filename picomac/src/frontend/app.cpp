@@ -16,6 +16,7 @@
 #include "settings.h"
 #include "../hal/hal.h"
 #include "../../core.h"
+#include "../mac/mac_snapshot.h"
 
 extern const EmuCore kMacPlus;
 const EmuCore *const kCores[] = { &kMacPlus };
@@ -232,6 +233,15 @@ static void chooseDisk() {
   settingsSave();
 }
 
+static void chooseDisk2() {
+  BrowseOpts o;
+  o.title = "Choose the second disk";
+  std::string path;
+  if (!browseRom(kMacPlus, path, &o)) return;
+  g_settings.disk2 = path;
+  settingsSave();
+}
+
 static bool fileExists(const std::string &p) {
   FILE *f = fopen(p.c_str(), "rb");
   if (f) fclose(f);
@@ -245,18 +255,25 @@ static void home() {
   scr.logo = true;
   scr.hints = "Enter|Select;<>|Change;Ctrl+Esc|Menu in the Mac";
   static int sel = 0;
-  enum { H_START, H_DISK, H_NODISK, H_ROM, H_RAM, H_SCREEN, H_SPEED, H_SETTING, H_LOADER };
+  enum { H_START, H_SNAP, H_DISK, H_NODISK, H_DISK2, H_NODISK2, H_ROM, H_RAM, H_SCREEN, H_SPEED, H_SETTING, H_LOADER };
   for (;;) {
     ui::Item items[16];
     int kind[16], arg[16];
     int n = 0;
     const std::string diskName = g_settings.disk.empty() ? "None" : fileName(g_settings.disk);
+    const std::string disk2Name = g_settings.disk2.empty() ? "None" : fileName(g_settings.disk2);
     const std::string romShown = fileExists(sdPath(g_settings.romPath.c_str())) ? fileName(g_settings.romPath) : "Missing";
     char speed[8];
     snprintf(speed, sizeof speed, "%dx", g_settings.speed);
     items[n] = { "Start the Mac", nullptr, ui::ICON_PLAY }; kind[n++] = H_START;
+    // From a snapshot: it brings its own disks, ROM, RAM and screen (as pico-386).
+    char snaps[8];
+    snprintf(snaps, sizeof snaps, "%u", (unsigned)macsnap_list().size());
+    items[n] = { "Load snapshot", snaps, ui::ICON_LOAD }; kind[n++] = H_SNAP;
     items[n] = { "Boot disk", diskName.c_str(), ui::ICON_FOLDER }; kind[n++] = H_DISK;
     if (!g_settings.disk.empty()) { items[n] = { "Eject (start with no disk)", nullptr, ui::ICON_UP }; kind[n++] = H_NODISK; }
+    items[n] = { "Second disk", disk2Name.c_str(), ui::ICON_FOLDER }; kind[n++] = H_DISK2;
+    if (!g_settings.disk2.empty()) { items[n] = { "Eject the second disk", nullptr, ui::ICON_UP }; kind[n++] = H_NODISK2; }
     items[n] = { "ROM", romShown.c_str(), ui::ICON_CART }; kind[n++] = H_ROM;
     items[n] = { "RAM", kRamNames[g_settings.ram], ui::ICON_GEAR, nullptr, -1, true }; kind[n++] = H_RAM;
     items[n] = { "Screen", kScreenNames[g_settings.screen], ui::ICON_PAD, nullptr, -1, true }; kind[n++] = H_SCREEN;
@@ -274,8 +291,18 @@ static void home() {
     const int d = k == KEY_LEFT ? -1 : 1;
     switch (kind[sel]) {
       case H_START: if (k == KEY_ENTER) { settingsSave(); return runMachine(kMacPlus, g_settings.disk); } break;
+      case H_SNAP:
+        if (k == KEY_ENTER) {
+          std::string snap;
+          if (!macsnap_pick("Load snapshot", snap)) break;
+          macsnap_set_pending(snap);              // mac_loadRom starts from it
+          return runMachine(kMacPlus, g_settings.disk);
+        }
+        break;
       case H_DISK: if (k == KEY_ENTER) chooseDisk(); break;
       case H_NODISK: if (k == KEY_ENTER) { g_settings.disk.clear(); settingsSave(); } break;
+      case H_DISK2: if (k == KEY_ENTER) chooseDisk2(); break;
+      case H_NODISK2: if (k == KEY_ENTER) { g_settings.disk2.clear(); settingsSave(); } break;
       case H_ROM: if (k == KEY_ENTER) chooseRom(); break;
       case H_RAM: if (change) g_settings.ram = (g_settings.ram + d + RAM_COUNT) % RAM_COUNT; break;
       case H_SCREEN: if (change) g_settings.screen = (g_settings.screen + d + SCREEN_COUNT) % SCREEN_COUNT; break;
@@ -303,6 +330,12 @@ void app_loop() {
     for (;;) ui::waitKey();   // its hotkeys still reach the loader / restart
   }
 #if defined(BOARD_DESKTOP)
+  if (const char *disk2 = getenv("MAC_DISK2")) g_settings.disk2 = disk2;              // test hook
+  if (const char *snap = getenv("MAC_SNAP")) {                                        // test hook: start from it
+    macsnap_set_pending(snap);
+    runMachine(kMacPlus, g_settings.disk);
+    exit(0);
+  }
   if (const char *disk = getenv("MAC_DISK")) {                                        // test hook
     runMachine(kMacPlus, disk);
     exit(0);

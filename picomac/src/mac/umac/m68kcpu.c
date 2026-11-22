@@ -1206,6 +1206,27 @@ void m68k_set_context(void* src)
 	if(src) m68ki_cpu = *(m68ki_cpu_core*)src;
 }
 
+/* pico-mac: a context from a snapshot. The cycle tables and the host callbacks are pointers into
+ * this build, so the running context's are kept. */
+void m68k_set_context_keep_hooks(void* src)
+{
+	m68ki_cpu_core live = m68ki_cpu;
+	if(!src) return;
+	m68ki_cpu = *(m68ki_cpu_core*)src;
+	m68ki_cpu.cyc_instruction = live.cyc_instruction;
+	m68ki_cpu.cyc_exception = live.cyc_exception;
+	m68ki_cpu.int_ack_callback = live.int_ack_callback;
+	m68ki_cpu.bkpt_ack_callback = live.bkpt_ack_callback;
+	m68ki_cpu.reset_instr_callback = live.reset_instr_callback;
+	m68ki_cpu.cmpild_instr_callback = live.cmpild_instr_callback;
+	m68ki_cpu.rte_instr_callback = live.rte_instr_callback;
+	m68ki_cpu.tas_instr_callback = live.tas_instr_callback;
+	m68ki_cpu.illg_instr_callback = live.illg_instr_callback;
+	m68ki_cpu.pc_changed_callback = live.pc_changed_callback;
+	m68ki_cpu.set_fc_callback = live.set_fc_callback;
+	m68ki_cpu.instr_hook_callback = live.instr_hook_callback;
+}
+
 /* ======================================================================== */
 /* ============================== MAME STUFF ============================== */
 /* ======================================================================== */

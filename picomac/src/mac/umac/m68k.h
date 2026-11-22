@@ -367,6 +367,8 @@ unsigned int m68k_get_context(void* dst);
 
 /* set the current cpu context */
 void m68k_set_context(void* dst);
+/* pico-mac: the same, keeping the running context's tables and callbacks (snapshots) */
+void m68k_set_context_keep_hooks(void* src);
 
 /* Register the CPU state information */
 void m68k_state_register(const char *type, int index);

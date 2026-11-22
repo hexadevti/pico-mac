@@ -55,6 +55,7 @@
 #include "rom.h"
 #include "disc.h"
 #include "umac.h"
+#include "state.h"
 
 #define FAST_FUNC(x)    x
 
@@ -326,9 +327,9 @@ void    umac_1hz_event(void)
 
 ////////////////////////////////////////////////////////////////////////////////
 // VIA-related controls
+static uint8_t  via_ra_old = 0x10;      /* pico-mac: out of the function, for snapshots */
 static void     via_ra_changed(uint8_t val)
 {
-        static uint8_t oldval = 0x10;
         // 7 = scc w/req,a,b (in, indicates RX pending, w/o IRQ)
         // 6 = vid.pg2 (screen buffer select)
         // 5 = hd.sel (SEL line, select head)
@@ -336,12 +337,12 @@ static void     via_ra_changed(uint8_t val)
         // 3 = snd.pg2 (sound buffer select)
         // [2:0] = sound volume
         overlay = !!(val & 0x10);
-        if ((oldval ^ val) & 0x10) {
+        if ((via_ra_old ^ val) & 0x10) {
                 MDBG("OVERLAY CHANGING\n");
                 update_overlay_layout();
         }
 
-        oldval = val;
+        via_ra_old = val;
 }
 
 static void     via_rb_changed(uint8_t val)
@@ -645,10 +646,27 @@ unsigned int    cpu_read_long_dasm(unsigned int address)
 }
 
 
+/* First sound-buffer word written since umac_sound_mark_reset() (-1 if none).
+ * The Sound Manager refills the buffer as a ring; this is where the ring starts. */
+static int snd_first_write = -1;
+
+static inline void snd_note_write(unsigned int a)
+{
+        if (snd_first_write < 0) {
+                unsigned int m = a - (umac_ram_size - 0x300);
+                unsigned int x = a - (umac_ram_size - 0x5f00);
+                if (m < 2 * 370)
+                        snd_first_write = m >> 1;
+                else if (x < 2 * 370)
+                        snd_first_write = x >> 1;
+        }
+}
+
 /* Write data to RAM or a device */
 void    FAST_FUNC(cpu_write_byte)(unsigned int address, unsigned int value)
 {
         if (IS_RAM(address)) {
+                snd_note_write(CLAMP_RAM_ADDR(address));
                 RAM_WR8(CLAMP_RAM_ADDR(address), value);
                 return;
         }
@@ -678,6 +696,7 @@ void    FAST_FUNC(cpu_write_byte)(unsigned int address, unsigned int value)
 void    FAST_FUNC(cpu_write_word)(unsigned int address, unsigned int value)
 {
         if (IS_RAM(address)) {
+                snd_note_write(CLAMP_RAM_ADDR(address));
                 RAM_WR16(CLAMP_RAM_ADDR(address), value);
                 return;
         }
@@ -691,6 +710,7 @@ void    FAST_FUNC(cpu_write_word)(unsigned int address, unsigned int value)
 void    FAST_FUNC(cpu_write_long)(unsigned int address, unsigned int value)
 {
         if (IS_RAM(address)) {
+                snd_note_write(CLAMP_RAM_ADDR(address));
                 RAM_WR32(CLAMP_RAM_ADDR(address), value);
                 return;
         }
@@ -819,6 +839,94 @@ int     umac_init(void *ram_base, void *rom_base, uint32_t ram_size, disc_descr_
         return 0;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// pico-mac: snapshots. The machine is saved between umac_run calls; a load goes into a machine
+// umac_init started with the same RAM size, screen size and disks.
+
+static const char umac_state_magic[8] = { 'U', 'M', 'A', 'C', 'S', 'T', '0', '1' };
+
+static void     machine_state(umac_state_t *s, void *cpu, uint32_t cpu_size)
+{
+        umac_st(s, cpu, cpu_size);
+        UMAC_ST(s, cpu_cycles);
+        UMAC_ST(s, via_base_ticks);
+        UMAC_ST(s, cyc_base);
+        UMAC_ST(s, speed_mult);
+        UMAC_ST(s, overlay);
+        UMAC_ST(s, rtc_seconds);
+        umac_st(s, rtc_pram, sizeof(rtc_pram));
+        UMAC_ST(s, rtc_wp);
+        UMAC_ST(s, rtc_last_pb);
+        UMAC_ST(s, rtc_state);
+        UMAC_ST(s, rtc_bits);
+        UMAC_ST(s, rtc_shift);
+        UMAC_ST(s, rtc_cmd);
+        UMAC_ST(s, rtc_out);
+        UMAC_ST(s, via_ra_old);
+        UMAC_ST(s, via_quadbits);
+        UMAC_ST(s, via_mouse_pressed);
+        UMAC_ST(s, kbd_last_cmd);
+        UMAC_ST(s, kbd_last_cmd_time);
+        umac_st(s, kbd_queue, sizeof(kbd_queue));
+        UMAC_ST(s, kbd_q_head);
+        UMAC_ST(s, kbd_q_tail);
+        UMAC_ST(s, scc_irq_state);
+        umac_st(s, iwm_regs, sizeof(iwm_regs));
+        UMAC_ST(s, disc_ejected);
+        UMAC_ST(s, old_dcd_a);
+        UMAC_ST(s, old_dcd_b);
+        UMAC_ST(s, pending_mouse_deltax);
+        UMAC_ST(s, pending_mouse_deltay);
+        via_state(s);
+        scc_state(s);
+        disc_state(s);
+        umac_st(s, _ram_base, umac_ram_size);
+}
+
+int     umac_save_state(umac_state_io io, void *ctx)
+{
+        umac_state_t s = { io, ctx, 0, 0 };
+        uint32_t head[4] = { umac_ram_size, (uint32_t)umac_disp_w, (uint32_t)umac_disp_h, m68k_context_size() };
+        void *cpu = malloc(head[3]);
+        if (!cpu)
+                return -1;
+        m68k_get_context(cpu);
+        umac_st(&s, (void *)umac_state_magic, sizeof(umac_state_magic));
+        umac_st(&s, head, sizeof(head));
+        machine_state(&s, cpu, head[3]);
+        free(cpu);
+        return s.err ? -1 : 0;
+}
+
+int     umac_load_state(umac_state_io io, void *ctx)
+{
+        umac_state_t s = { io, ctx, 1, 0 };
+        char magic[8];
+        uint32_t head[4];
+        umac_st(&s, magic, sizeof(magic));
+        umac_st(&s, head, sizeof(head));
+        if (s.err)
+                return -1;
+        if (memcmp(magic, umac_state_magic, 8) || head[0] != umac_ram_size || head[1] != (uint32_t)umac_disp_w ||
+            head[2] != (uint32_t)umac_disp_h || head[3] != m68k_context_size())
+                return -2;
+        void *cpu = malloc(head[3]);
+        if (!cpu)
+                return -1;
+        machine_state(&s, cpu, head[3]);
+        if (!s.err)
+                m68k_set_context_keep_hooks(cpu);
+        free(cpu);
+        if (s.err)
+                return -1;
+        in_slice = 0;
+        slice_ended = 0;
+        sim_done = 0;
+        error_guard = 0;
+        update_overlay_layout();
+        return 0;
+}
+
 void    umac_reset(void)
 {
         machine_reset();
@@ -915,6 +1023,64 @@ int     umac_disc_was_ejected(void)
 /* Run the emulator for about this many CPU cycles.
  * Returns 0 for not-done, 1 when an exit/done condition arises.
  */
+/* pico-mac: for finding where a hung Mac loops (mac_core's "@mac" serial command). The PC
+ * after each slice of umac_run goes to buf, up to n of them. */
+static uint32_t *pc_samples;
+static int       pc_want, pc_count;
+
+void    umac_pc_sample(uint32_t *buf, int n)
+{
+        pc_samples = buf;
+        pc_count = 0;
+        pc_want = buf ? n : 0;
+}
+
+int     umac_pc_sampled(void)
+{
+        return pc_count;
+}
+
+int     umac_dump_regs(char *buf, int len)
+{
+        return m68k_dump_regs(buf, len);
+}
+
+/* The System 7 sound driver can VInstall its VBL task while the task is still in the queue (its
+ * "running" flag is cleared before the ROM dequeues it, and a nested interrupt can start a sound
+ * in that window). Enqueue then links the tail element to itself, and the ROM's VBL loop spins
+ * forever. Once per umac_run the queue is walked; a link back to an element already seen is cut
+ * there, which leaves the element queued once, as the second VInstall should have.
+ */
+static int vbl_fixes;
+
+static void     vbl_queue_repair(void)
+{
+        enum { QHEAD = 0x162, QTAIL = 0x166, MAXQ = 64 };
+        uint32_t seen[MAXQ];
+        int n = 0;
+        uint32_t e = RAM_RD32(QHEAD) & 0xffffff;
+        while (e) {
+                if (e >= umac_ram_size - 4 || (e & 1) || n == MAXQ)
+                        return;                 /* not a list we can judge */
+                seen[n++] = e;
+                uint32_t next = RAM_RD32(e) & 0xffffff;
+                for (int i = 0; i < n; i++) {
+                        if (seen[i] == next) {
+                                RAM_WR32(e, 0);
+                                RAM_WR32(QTAIL, e);
+                                vbl_fixes++;
+                                return;
+                        }
+                }
+                e = next;
+        }
+}
+
+int     umac_vbl_fixes(void)
+{
+        return vbl_fixes;
+}
+
 int     umac_run(uint32_t cycles)
 {
         if (sim_done)
@@ -942,6 +1108,8 @@ int     umac_run(uint32_t cycles)
                 slice_ended = 0;
                 int used = m68k_execute((int)slice);
                 in_slice = 0;
+                if (pc_count < pc_want)
+                        pc_samples[pc_count++] = m68k_get_reg(NULL, M68K_REG_PC);
                 if (used < 1)
                         used = 1;
                 cpu_cycles += used;
@@ -950,6 +1118,7 @@ int     umac_run(uint32_t cycles)
                 mouse_tick();
                 kbd_check_work();
         }
+        vbl_queue_repair();
         return sim_done;
 }
 
@@ -981,4 +1150,14 @@ int     umac_sound_enabled(void)
 int     umac_sound_volume(void)
 {
         return via_get_ora() & 7;
+}
+
+int     umac_sound_first_write(void)
+{
+        return snd_first_write;
+}
+
+void    umac_sound_mark_reset(void)
+{
+        snd_first_write = -1;
 }

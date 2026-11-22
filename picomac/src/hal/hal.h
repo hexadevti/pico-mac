@@ -42,6 +42,9 @@ uint32_t hal_micros();
 void     hal_delay(uint32_t ms);
 void     hal_yield();                      // let other tasks / the SDL event loop run
 void     hal_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// A console command the HAL does not know (e.g. "@mac"), for the core. Called on the input task:
+// the core should only note it. Set by the core; may stay null.
+extern void (*hal_serial_cmd)(const char *line);
 void     hal_reboot();
 void     hal_reboot_to_loader();           // PicoMultiLoader / esp32loader menu; quit on the desktop
 void    *hal_alloc_big(size_t n);          // PSRAM on the P4 (zeroed)

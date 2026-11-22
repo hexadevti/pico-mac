@@ -33,26 +33,33 @@ name:
 
 open:
         // Open()
-        // Allocate drive status block and pass to Open routine:
-        movem.l %a0-%a1, -(%sp)
-        move.b  #SONY_STATUS_SIZE, %d0
+        // pico-mac: one drive per index (d1 = 0, 1, ...). Each gets a new drive status block,
+        // and the PV call returns the drive number to AddDrive, or 0 when there are no more.
+        movem.l %d3/%a0-%a3, -(%sp)
+        moveq   #0, %d3                         // drive index
+1:      moveq   #SONY_STATUS_SIZE, %d0
         .word   0xa71e                          // NewPtrSysClear
+        move.l  %a0, %d1
+        beq     3f                              // lolfail
         move.l  %a0, %a2
-        movem.l (%sp)+, %a0-%a1
-        cmp.l   #0, %a2
-        beq     2f                              // lolfail
-
+        movem.l 4(%sp), %a0-%a1                 // the pb and DCE again
+        move.l  %d3, %d1
         move.l  (faulting_address), %a3
-        move.b  #0, (%a3)                       // Fault! Open: op 0
-
-        // FIXME: Support variable number of drives
+        move.b  #0, (%a3)                       // Fault! Open: op 0 -> d0 = drive number
+        tst.l   %d0
+        ble     2f
         // Now add the drive:
-        move.l  #(0x00010000 + (0xffff & SONY_REF_NUM)), %d0
-        move.l  %a2, %a0
-        add.l   #6, %a0
+        swap    %d0                             // drive number in the high word
+        move.w  #SONY_REF_NUM, %d0
+        lea     6(%a2), %a0
         .word   0xa04e                          // AddDrive
-1:      rts
-2:      moveq   #-23, %d0
+        addq.l  #1, %d3
+        bra     1b
+2:      movem.l (%sp)+, %d3/%a0-%a3
+        moveq   #0, %d0
+        rts
+3:      movem.l (%sp)+, %d3/%a0-%a3
+        moveq   #-23, %d0
         rts
 
 prime:
@@ -65,7 +72,17 @@ control:
         // Control()
         move.l  (faulting_address), %a2
         move.b  #2, (%a2)                       // Control: op 2
-        cmp.w   #1, 0x1a(%a0)
+        cmp.w   #65, 0x1a(%a0)                  // pico-mac: accRun returns a drive to mount
+        bne.b   1f
+        tst.l   %d0
+        ble.b   IOReturn
+        move.l  %a0, -(%sp)
+        move.w  #7, %a0                         // diskEvt
+        .word   0xa02f                          // PostEvent(diskEvt, drive number in d0)
+        move.l  (%sp)+, %a0
+        moveq   #0, %d0
+        bra.b   IOReturn
+1:      cmp.w   #1, 0x1a(%a0)
         bne.b   IOReturn
         rts
 
