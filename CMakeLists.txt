@@ -52,9 +52,9 @@ if(NOT EMU_PORTABLE)
 endif()
 # Third-party emulator C code is written for embedded compilers; keep its warnings out of the way.
 set_source_files_properties(${EMU_SRC} PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:C>:-w>")
-# umac + Musashi: always optimised, a 68000 interpreter at -Og is too slow to judge timing and sound.
+# umac + Musashi (and its 68020 build, src/mac2/m68k*): always optimised, a 68000 interpreter at -Og is too slow to judge timing and sound.
 set(UMAC_SRC ${EMU_SRC})
-list(FILTER UMAC_SRC INCLUDE REGEX "/src/mac/umac/")
+list(FILTER UMAC_SRC INCLUDE REGEX "/src/mac/umac/|/src/mac2/m68k")
 set_source_files_properties(${UMAC_SRC} PROPERTIES COMPILE_OPTIONS "-w;-O2")
 
 if(TARGET SDL2::SDL2)

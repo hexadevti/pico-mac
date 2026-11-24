@@ -71,6 +71,9 @@ const char *hal_sd_root()      { return s_sdRoot.c_str(); }
 
 // mac_core.cpp: the Mac's whole screen as RGB565 (w x h), null when no Mac runs
 const uint16_t *maccore_fullshot(int *w, int *h);
+const uint16_t *maciicore_fullshot(int *w, int *h);
+void maciicore_mouse(int x, int y, int button);   // the Mac II: the pointer and the button
+void maciicore_disk2(const char *path);            // the Mac II: a disk into drive 2 while it runs
 
 static void saveShot(const char *name) {
   SDL_Surface *sf = SDL_CreateRGBSurfaceWithFormatFrom(s_panel, PANEL_W, PANEL_H, 16, PANEL_W * 2, SDL_PIXELFORMAT_RGB565);
@@ -166,7 +169,8 @@ void hal_yield() {
 }
 
 // Test hook: MAC_KEYS is a KeyScript (keyscript.h) run once the queue is empty. Besides keys and
-// waits: "shot" saves <sd>/shotN.bmp; "dump" is the console's "@mac"; "quit" exits.
+// waits: "shot" saves <sd>/shotN.bmp; "dump" is the console's "@mac"; "quit" exits. On the Mac II,
+// "atXxY" puts the pointer at (X, Y) and "mdown" / "mup" press and release the button.
 static void scriptStep() {
   static KeyScript ks;
   static bool started = false;
@@ -193,11 +197,17 @@ static void scriptStep() {
   char t[32];
   if (!ks.step(hal_millis(), s_qHead == s_qTail, qPush, t, sizeof(t))) return;
   if (!strcmp(t, "quit")) exit(0);
+  int mx, my;
+  if (sscanf(t, "at%dx%d", &mx, &my) == 2) maciicore_mouse(mx, my, -1);
+  if (!strcmp(t, "mdown")) maciicore_mouse(-1, -1, 1);
+  if (!strcmp(t, "mup")) maciicore_mouse(-1, -1, 0);
+  if (!strcmp(t, "disk2")) maciicore_disk2(getenv("MAC_DISK2_LATER"));   // test hook
   if (!strcmp(t, "dump") && hal_serial_cmd) hal_serial_cmd("@mac");
   if (!strcmp(t, "shot")) { char n[32]; snprintf(n, sizeof(n), "shot%d.bmp", ++shots); saveShot(n); }
   // bigshot: the Mac's whole screen, which the panel may scale or pan
   int bw = 0, bh = 0;
   const uint16_t *big = !strcmp(t, "bigshot") ? maccore_fullshot(&bw, &bh) : nullptr;
+  if (!big && !strcmp(t, "bigshot")) big = maciicore_fullshot(&bw, &bh);
   if (big) {
     char n[32];
     snprintf(n, sizeof(n), "shot%d.bmp", ++shots);

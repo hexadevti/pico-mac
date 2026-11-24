@@ -377,7 +377,12 @@ typedef uint32 uint64;
 #if M68K_DYNAMIC_INSTR_TABLES && M68K_CYCLE_COUNTING
 #define CYC_INSTRUCTION(x)      m68ki_cpu.cyc_instruction[x]
 #else
-#define CYC_INSTRUCTION(x)      (8)
+/* pico-mac: one cost for every instruction; a configuration may set its own (the Mac II's 68020
+ * does more per cycle than the 68000). */
+#ifndef M68K_STATIC_INSTR_CYCLES
+#define M68K_STATIC_INSTR_CYCLES 8
+#endif
+#define CYC_INSTRUCTION(x)      (M68K_STATIC_INSTR_CYCLES)
 #endif
 
 #define CYC_EXCEPTION    m68ki_cpu.cyc_exception
@@ -454,6 +459,13 @@ typedef uint32 uint64;
 	#define CPU_TYPE_IS_010_PLUS(A)    CPU_TYPE_IS_EC020_PLUS(A)
 	#define CPU_TYPE_IS_010_LESS(A)    CPU_TYPE_IS_EC020_LESS(A)
 #endif
+
+/* pico-mac: a 68881/68882 next to a 68020 (the Mac II) when M68K_EMULATE_FPU is ON; the 030+
+ * always had the FPU ops here. */
+#ifndef M68K_EMULATE_FPU
+#define M68K_EMULATE_FPU 0
+#endif
+#define CPU_HAS_FPU(A) (CPU_TYPE_IS_030_PLUS(A) || (M68K_EMULATE_FPU && CPU_TYPE_IS_020_PLUS(A)))
 
 #if M68K_EMULATE_020 || M68K_EMULATE_EC020
 	#define CPU_TYPE_IS_020_VARIANT(A) ((A) & (CPU_TYPE_EC020 | CPU_TYPE_020))

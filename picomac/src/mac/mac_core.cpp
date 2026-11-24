@@ -616,6 +616,16 @@ bool powerOn() {
 // Saved and loaded once the menu has closed (mac_runFrame), as pico-386 does.
 std::string s_snapSave, s_snapReplace, s_snapLoad;  // the save's name, the snapshot it overwrites
 
+int snapWrite(void *ctx, void *p, unsigned n) { return fwrite(p, 1, n, (FILE *)ctx) == n ? 0 : 1; }
+int snapRead(void *ctx, void *p, unsigned n) { return fread(p, 1, n, (FILE *)ctx) == n ? 0 : 1; }
+bool saveState(FILE *f) { return umac_save_state(snapWrite, f) == 0; }
+int loadState(FILE *f) { return umac_load_state(snapRead, f); }
+// The screen for the snapshot's picture: 1 bit a pixel, set = black.
+uint32_t screenPixel(int x, int y) {
+  const int i = y * umac_disp_w + x;
+  return (s_ram[umac_get_fb_offset() + (i >> 3)] & (0x80 >> (i & 7))) ? 0 : 0xFFFFFF;
+}
+
 void saveSnapshot() {
   hal_job_wait();
   showNote("Saving snapshot...");
@@ -626,7 +636,7 @@ void saveSnapshot() {
   m.rom = g_settings.romPath;
   for (int i = 0; i < RAM_COUNT; i++) if (kRamSizes[i] == s_ramSize) m.ram = i;
   m.screen = s_screenLive == SCREEN_NATIVE ? SCREEN_NATIVE : g_settings.screen == SCREEN_NATIVE ? SCREEN_FIT : g_settings.screen;
-  const char *e = macsnap_save(s_snapSave, s_snapReplace, m, s_ram + umac_get_fb_offset(), umac_disp_w, umac_disp_h);
+  const char *e = macsnap_save(s_snapSave, s_snapReplace, m, screenPixel, umac_disp_w, umac_disp_h, saveState);
   // The disks as they are now go with it: their next write is a new generation.
   if (!e) for (Disk &d : s_disks) d.touched = false;
   showNote(e ? e : ("Saved: " + s_snapSave).c_str());
@@ -651,7 +661,7 @@ bool startFromSnapshot(const std::string &snap) {
   releaseAll();
   if (!powerOn()) return false;
   bool broken;
-  if (const char *e = macsnap_restore(snap, &broken)) {
+  if (const char *e = macsnap_restore(snap, &broken, loadState)) {
     ui::message("Snapshot", e, 2500);
     hal_panel_fill(0, 0, PANEL_W, PANEL_H, 0);
     return broken ? powerOn() : true;               // not "broken": nothing was loaded

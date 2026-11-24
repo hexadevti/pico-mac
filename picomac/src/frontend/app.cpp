@@ -19,7 +19,8 @@
 #include "../mac/mac_snapshot.h"
 
 extern const EmuCore kMacPlus;
-const EmuCore *const kCores[] = { &kMacPlus };
+extern const EmuCore kMacII;
+const EmuCore *const kCores[] = { &kMacPlus, &kMacII };
 const int kNumCores = sizeof(kCores) / sizeof(kCores[0]);
 
 static const char *const kRamNames[RAM_COUNT] = { "512 KB", "1 MB", "2 MB", "4 MB" };
@@ -138,7 +139,7 @@ static void showFps(const EmuCore &core, uint32_t fps, uint32_t drawn, unsigned 
 }
 
 static void runMachine(const EmuCore &core, const std::string &disk) {
-  ui::message("Starting", disk.empty() ? "Macintosh Plus, no disk" : fileName(disk).c_str());
+  ui::message("Starting", disk.empty() ? (std::string(core.name) + ", no disk").c_str() : fileName(disk).c_str());
   if (!core.init() || !core.loadRom(disk.c_str())) {
     ui::drawBackground();
     ui::message("Error", core.lastError ? core.lastError() : "Cannot start", 3000);
@@ -200,29 +201,37 @@ static void runMachine(const EmuCore &core, const std::string &disk) {
 // ------------------------------------------------------------------------------------------------
 // home
 // ------------------------------------------------------------------------------------------------
-// The ROM: any 128 KB file; mac_core checks it is a Plus v3 when the Mac starts.
+// The machine the home menu starts.
+static const EmuCore &machineCore() { return g_settings.machine == MACHINE_II ? kMacII : kMacPlus; }
+static const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II" };
+static const char *const kRam2Names[RAM2_COUNT] = { "1 MB", "2 MB", "4 MB", "8 MB" };
+
+// The ROM: any 128 KB file for the Plus (mac_core checks it is a Plus v3 when the Mac starts),
+// 256 KB for the Mac II.
 static bool acceptRom(const std::string &path, std::string &tag) {
   FILE *f = fopen(path.c_str(), "rb");
   if (!f) return false;
   fseek(f, 0, SEEK_END);
   const long n = ftell(f);
   fclose(f);
-  if (n != 128 * 1024) return false;
-  tag = "128K";
+  const bool ii = g_settings.machine == MACHINE_II;
+  if (n != (ii ? 256 : 128) * 1024) return false;
+  tag = ii ? "256K" : "128K";
   return true;
 }
 
 static void chooseRom() {
   BrowseOpts o;
-  o.title = "Choose the Mac Plus ROM";
+  const bool ii = g_settings.machine == MACHINE_II;
+  o.title = ii ? "Choose the Mac II ROM" : "Choose the Mac Plus ROM";
   o.accept = acceptRom;
   o.exts = ".rom.bin";
   const std::string start = sdPath("picomac");
   o.startDir = start.c_str();
   std::string path;
-  if (!browseRom(kMacPlus, path, &o)) return;
+  if (!browseRom(machineCore(), path, &o)) return;
   const std::string root = hal_sd_root();
-  g_settings.romPath = path.size() > root.size() + 1 ? path.substr(root.size() + 1) : path;
+  (ii ? g_settings.romPathII : g_settings.romPath) = path.size() > root.size() + 1 ? path.substr(root.size() + 1) : path;
   settingsSave();
 }
 
@@ -251,33 +260,39 @@ static bool fileExists(const std::string &p) {
 static void home() {
   ui::Screen scr;
   scr.title = "pico-mac";
-  scr.subtitle = "Macintosh Plus";
+  scr.subtitle = machineCore().name;
   scr.logo = true;
   scr.hints = "Enter|Select;<>|Change;Ctrl+Esc|Menu in the Mac";
   static int sel = 0;
-  enum { H_START, H_SNAP, H_DISK, H_NODISK, H_DISK2, H_NODISK2, H_ROM, H_RAM, H_SCREEN, H_SPEED, H_SETTING, H_LOADER };
+  enum { H_START, H_MACHINE, H_SNAP, H_DISK, H_NODISK, H_DISK2, H_NODISK2, H_ROM, H_RAM, H_SCREEN, H_SPEED, H_SETTING, H_LOADER };
   for (;;) {
     ui::Item items[16];
     int kind[16], arg[16];
     int n = 0;
     const std::string diskName = g_settings.disk.empty() ? "None" : fileName(g_settings.disk);
     const std::string disk2Name = g_settings.disk2.empty() ? "None" : fileName(g_settings.disk2);
-    const std::string romShown = fileExists(sdPath(g_settings.romPath.c_str())) ? fileName(g_settings.romPath) : "Missing";
+    const bool ii = g_settings.machine == MACHINE_II;
+    const std::string &romRel = ii ? g_settings.romPathII : g_settings.romPath;
+    const std::string romShown = fileExists(sdPath(romRel.c_str())) ? fileName(romRel) : "Missing";
+    scr.subtitle = machineCore().name;
     char speed[8];
     snprintf(speed, sizeof speed, "%dx", g_settings.speed);
     items[n] = { "Start the Mac", nullptr, ui::ICON_PLAY }; kind[n++] = H_START;
+    items[n] = { "Machine", kMachineNames[g_settings.machine], ui::ICON_GEAR, nullptr, -1, true }; kind[n++] = H_MACHINE;
     // From a snapshot: it brings its own disks, ROM, RAM and screen (as pico-386).
     char snaps[8];
     snprintf(snaps, sizeof snaps, "%u", (unsigned)macsnap_list().size());
-    items[n] = { "Load snapshot", snaps, ui::ICON_LOAD }; kind[n++] = H_SNAP;
+    items[n] = { "Load snapshot", snaps, ui::ICON_LOAD }; kind[n++] = H_SNAP;   // the machine's own snapshots
     items[n] = { "Boot disk", diskName.c_str(), ui::ICON_FOLDER }; kind[n++] = H_DISK;
     if (!g_settings.disk.empty()) { items[n] = { "Eject (start with no disk)", nullptr, ui::ICON_UP }; kind[n++] = H_NODISK; }
     items[n] = { "Second disk", disk2Name.c_str(), ui::ICON_FOLDER }; kind[n++] = H_DISK2;
     if (!g_settings.disk2.empty()) { items[n] = { "Eject the second disk", nullptr, ui::ICON_UP }; kind[n++] = H_NODISK2; }
     items[n] = { "ROM", romShown.c_str(), ui::ICON_CART }; kind[n++] = H_ROM;
-    items[n] = { "RAM", kRamNames[g_settings.ram], ui::ICON_GEAR, nullptr, -1, true }; kind[n++] = H_RAM;
-    items[n] = { "Screen", kScreenNames[g_settings.screen], ui::ICON_PAD, nullptr, -1, true }; kind[n++] = H_SCREEN;
-    items[n] = { "CPU speed", speed, ui::ICON_SKIP, nullptr, -1, true }; kind[n++] = H_SPEED;
+    items[n] = { "RAM", ii ? kRam2Names[g_settings.ramII] : kRamNames[g_settings.ram], ui::ICON_GEAR, nullptr, -1, true }; kind[n++] = H_RAM;
+    // The Mac II has Fit and 1:1 pan only (its Fit is 320x240 in colour).
+    items[n] = { "Screen", ii ? (g_settings.screen == SCREEN_PAN ? "1:1 pan" : "Fit 320x240") : kScreenNames[g_settings.screen],
+                 ui::ICON_PAD, nullptr, -1, true }; kind[n++] = H_SCREEN;
+    if (!ii) { items[n] = { "CPU speed", speed, ui::ICON_SKIP, nullptr, -1, true }; kind[n++] = H_SPEED; }   // the Mac II runs at 1x
     int rowOf[4];
     const int s = settingItems(items + n, rowOf);
     for (int i = 0; i < s; i++) { kind[n + i] = H_SETTING; arg[n + i] = rowOf[i]; }
@@ -290,13 +305,14 @@ static void home() {
     const bool change = k == KEY_LEFT || k == KEY_RIGHT || k == KEY_ENTER;
     const int d = k == KEY_LEFT ? -1 : 1;
     switch (kind[sel]) {
-      case H_START: if (k == KEY_ENTER) { settingsSave(); return runMachine(kMacPlus, g_settings.disk); } break;
+      case H_START: if (k == KEY_ENTER) { settingsSave(); return runMachine(machineCore(), g_settings.disk); } break;
+      case H_MACHINE: if (change) settingsSetMachine((g_settings.machine + d + MACHINE_COUNT) % MACHINE_COUNT); break;
       case H_SNAP:
         if (k == KEY_ENTER) {
           std::string snap;
           if (!macsnap_pick("Load snapshot", snap)) break;
           macsnap_set_pending(snap);              // mac_loadRom starts from it
-          return runMachine(kMacPlus, g_settings.disk);
+          return runMachine(machineCore(), g_settings.disk);
         }
         break;
       case H_DISK: if (k == KEY_ENTER) chooseDisk(); break;
@@ -304,8 +320,16 @@ static void home() {
       case H_DISK2: if (k == KEY_ENTER) chooseDisk2(); break;
       case H_NODISK2: if (k == KEY_ENTER) { g_settings.disk2.clear(); settingsSave(); } break;
       case H_ROM: if (k == KEY_ENTER) chooseRom(); break;
-      case H_RAM: if (change) g_settings.ram = (g_settings.ram + d + RAM_COUNT) % RAM_COUNT; break;
-      case H_SCREEN: if (change) g_settings.screen = (g_settings.screen + d + SCREEN_COUNT) % SCREEN_COUNT; break;
+      case H_RAM:
+        if (!change) break;
+        if (ii) g_settings.ramII = (g_settings.ramII + d + RAM2_COUNT) % RAM2_COUNT;
+        else g_settings.ram = (g_settings.ram + d + RAM_COUNT) % RAM_COUNT;
+        break;
+      case H_SCREEN:
+        if (!change) break;
+        if (ii) g_settings.screen = g_settings.screen == SCREEN_PAN ? SCREEN_FIT : SCREEN_PAN;
+        else g_settings.screen = (g_settings.screen + d + SCREEN_COUNT) % SCREEN_COUNT;
+        break;
       case H_SPEED: if (change) g_settings.speed = (g_settings.speed - 1 + d + 4) % 4 + 1; break;
       case H_SETTING: if (change) adjustSetting(arg[sel], k == KEY_ENTER ? KEY_RIGHT : k); break;
       case H_LOADER: if (k == KEY_ENTER) hal_reboot_to_loader(); break;
@@ -330,14 +354,17 @@ void app_loop() {
     for (;;) ui::waitKey();   // its hotkeys still reach the loader / restart
   }
 #if defined(BOARD_DESKTOP)
+  if (const char *m = getenv("MAC_MACHINE"))                                          // test hook: "ii" or "plus"
+    settingsSetMachine(!strcmp(m, "ii") ? MACHINE_II : MACHINE_PLUS);
   if (const char *disk2 = getenv("MAC_DISK2")) g_settings.disk2 = disk2;              // test hook
+  if (const char *rom = getenv("MAC_ROM2")) g_settings.romPathII = rom;               // test hook (relative to the card)
   if (const char *snap = getenv("MAC_SNAP")) {                                        // test hook: start from it
     macsnap_set_pending(snap);
-    runMachine(kMacPlus, g_settings.disk);
+    runMachine(machineCore(), g_settings.disk);
     exit(0);
   }
   if (const char *disk = getenv("MAC_DISK")) {                                        // test hook
-    runMachine(kMacPlus, disk);
+    runMachine(machineCore(), disk);
     exit(0);
   }
 #endif

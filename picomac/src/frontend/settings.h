@@ -9,6 +9,9 @@
 enum { SCREEN_FIT, SCREEN_PAN, SCREEN_NATIVE, SCREEN_COUNT };
 // RAM sizes in KB
 enum { RAM_512K, RAM_1M, RAM_2M, RAM_4M, RAM_COUNT };
+// The machine the home menu starts, and the Mac II's RAM sizes
+enum { MACHINE_PLUS, MACHINE_II, MACHINE_COUNT };
+enum { RAM2_1M, RAM2_2M, RAM2_4M, RAM2_8M, RAM2_COUNT };
 
 struct Settings {
   int volume = 7;            // 0..10
@@ -21,12 +24,18 @@ struct Settings {
   std::string disk;          // the boot disk image (full path), "" = none yet
   std::string disk2;         // a second disk (drive 2), "" = none
   int arrows = 1;            // what the arrows do: 0 Mac arrow keys, 1 the pointer, 2 both
+  int machine = MACHINE_PLUS;
+  std::string romPathII = "picomac/macii.rom";   // the Mac II's ROM, relative to the card root
+  int ramII = RAM2_4M;
 };
 
 extern Settings g_settings;
 
 void settingsLoad();
 void settingsSave();
+// disk, disk2, screen and speed are per machine: g_settings holds the current machine's, and
+// this keeps them aside and brings in machine m's (then saves).
+void settingsSetMachine(int m);
 
 // <sd root>/<rel>, and a mkdir -p for it (the path's own last component included).
 std::string sdPath(const char *rel);
