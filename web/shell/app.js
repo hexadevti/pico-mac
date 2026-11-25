@@ -980,6 +980,10 @@ function bindTouchpad(el, mouseToo, zoomable) {
   const buzz = () => { try { navigator.vibrate && navigator.vibrate(12); } catch (_) {} };
   let pinch = null, gesture = false;  // two fingers down / they zoomed or panned since the first went down
   const abs = () => zoomable && touchAbs;   // the screen as a touch screen
+  // the screen while the trackpad shows: the trackpad is the mouse, so a touch here only zooms (two
+  // fingers) and moves the zoomed view (one finger or two); it clicks nothing and moves no pointer
+  const viewOnly = () => zoomable && !$('#pad').hidden;
+  let view = null;                    // one finger panning the zoomed view: where it and the view started
   const twoOf = () => {
     const [p, q] = [...touches.values()], r = pcCanvas.getBoundingClientRect();
     return { d: Math.hypot(p.x - q.x, p.y - q.y), mx: ((p.x + q.x) / 2 - r.left) / r.width,
@@ -997,6 +1001,16 @@ function bindTouchpad(el, mouseToo, zoomable) {
     clearSelection();
     touches.set(e.pointerId, { x: e.clientX, y: e.clientY, t: performance.now(), moved: 0, hx: 0, hy: 0 });
     clearTimeout(holdT);
+    if (viewOnly()) {
+      view = null; pinch = null;
+      if (touches.size === 1) view = { id: e.pointerId, x: e.clientX, y: e.clientY, u: zu, v: zv };
+      else if (touches.size === 2 && screenKind === 'pc') {
+        const g = twoOf();
+        pinch = { d0: g.d, mx0: g.mx, my0: g.my, s0: zoom, a: zu + g.mx / zoom, b: zv + g.my / zoom };
+      }
+      el.classList.add('touch');
+      return;
+    }
     if (touches.size > 1) {
       multi = true;
       if (abs()) absCancel();
@@ -1036,6 +1050,16 @@ function bindTouchpad(el, mouseToo, zoomable) {
       return;
     }
     if (gesture) return;              // a finger left over from a pinch moves nothing
+    if (viewOnly()) {
+      if (view && view.id === e.pointerId && touches.size === 1 && zoom > 1) {
+        const r = pcCanvas.getBoundingClientRect();
+        if (!r.width || !r.height) return;
+        zu = Math.min(1 - 1 / zoom, Math.max(0, view.u - (e.clientX - view.x) / r.width / zoom));
+        zv = Math.min(1 - 1 / zoom, Math.max(0, view.v - (e.clientY - view.y) / r.height / zoom));
+        drawPc();
+      }
+      return;
+    }
     if (p.moved >= STILL) clearTimeout(holdT);
     if (!abs() && !pinch && touches.size === 2) {
       // the trackpad's two fingers: the first to move steers; if the other rests, the button is held
@@ -1066,6 +1090,11 @@ function bindTouchpad(el, mouseToo, zoomable) {
     touches.delete(e.pointerId);
     pinch = null;
     clearTimeout(holdT);
+    if (view || viewOnly()) {         // the view's touches: nothing to let go, no click
+      view = null;
+      if (touches.size === 0) { el.classList.remove('touch'); gesture = false; multi = false; lastTap = 0; }
+      return;
+    }
     if (e.pointerId === steer) steer = null;           // the resting finger keeps the button down
     if (e.pointerId === rest) {                        // the "thumb" lifts: the button goes up
       rest = null;

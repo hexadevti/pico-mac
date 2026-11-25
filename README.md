@@ -103,6 +103,8 @@ Mac II or Mac IIci), a Mac keyboard (⌘, ⌥, ⌃ Control for the Mac II, Caps,
 - **Touch on the screen** (the default): the pointer goes where the finger touches. Tap to click,
   tap twice to double-click, and hold, then slide, to drag or to pull down a menu. 📁 → More turns
   it off, and the screen becomes a trackpad: slide to move, tap to click, tap twice and slide to drag.
+- While the trackpad (🖱, or the one at the side of a sideways screen) shows, it is the mouse: a touch
+  on the screen clicks nothing. Two fingers pinch to zoom, and one finger or two move the zoomed view.
 - **Game keys** (🎮): a tap on the ⇄ key (next to Esc) turns the arrow pad into the movement
   letters (↑ W, ← A, ↓ S, → D, the corners two letters at once) and back. Holding it for 2 seconds switches the letters: WASD, ESDF, IJKL, ZQSD (AZERTY)
   or QAOP. The page remembers both. Ctrl is the Mac II's Control key.
