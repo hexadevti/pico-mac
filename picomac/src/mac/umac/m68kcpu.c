@@ -48,7 +48,11 @@ extern void m68881_mmu_ops(void);
 #include "m68kcpu.h"
 
 #include "m68kfpu_inc.h"   // pico-mac: was m68kfpu.c; Arduino would compile it on its own, and copies no .inc
+#ifdef M68K_MMU_HEADER   // pico-mac: the Mac IIci's 68030 brings its own PMMU instructions
+#include M68K_MMU_HEADER
+#else
 #include "m68kmmu.h" // uses some functions from m68kfpu.c which are static !
+#endif
 
 
 #if M68K_DYNAMIC_INSTR_TABLES

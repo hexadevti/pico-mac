@@ -85,9 +85,17 @@ Changes:
     handlers in m68kops.c and tools/musashi-gen/m68k_in.c test it instead of `CPU_TYPE_IS_030_PLUS`.
   - **M68K_STATIC_INSTR_CYCLES** (m68kcpu.h): the cycles charged per instruction with static
     tables, which was a fixed 8. It defaults to 8; the 68020 build uses 5.
+  - **fx80_normalize** (m68kfpu_inc.h): `fpgen_rm_reg` normalizes an unnormalized extended
+    operand (exponent set, integer bit clear) before the operation, as the 68881 does. Softfloat
+    assumes normal operands: floatx80_div's correction loop ran ~2^63/significand times, and
+    SimCity 2000's power grid froze the Mac II for minutes.
   - **M68K_FIXED_CPU_API** (m68kcpu.c): with a fixed CPU type, `m68k_set_cpu_type` asserts against
     this API value when it is defined, because `CPU_TYPE_020` (internal) differs from
     `M68K_CPU_TYPE_68020` (the API).
+- For the Mac IIci's 68030 build: **M68K_MMU_HEADER** (m68kcpu.c): when the config defines it,
+  m68kcpu.c includes that header in place of m68kmmu.h. The IIci's maciici_mmu.h holds the PMMU
+  instructions there (PMOVE, PLOAD, PFLUSH, PTEST); the table walk and the translation cache are
+  in the core's bus. Without the define nothing changes.
 
 ### The 68020 build (picomac/src/mac2/m68k*)
 
@@ -119,6 +127,14 @@ m68kconf020.h differs from umac's m68kconf.h in these ways:
   with a section attribute; the Musashi sources are not edited for it.
 
 - The ILLG callback also takes opcodes 0x7120-0x7123, from our .Sony driver (below).
+
+### The 68030 build (picomac/src/mac2/m68k*030*, the Mac IIci; not on the P4)
+
+A third compile of the same sources, as the 020 build: m68kcpu030.c and m68kops030.c with
+m68kconf030.h (a fixed `CPU_TYPE_030`, the FPU, `HAS_PMMU`, and `M68K_MMU_HEADER` = maciici_mmu.h)
+and m68k030_names.h for the symbols (`m68k030_*`). maciici_core.cpp compiles macii_core.cpp again
+with `MACII_IICI` and maciici_names.h, so the IIci core is the Mac II's with its own memory map
+(the RBV in place of VIA2, two RAM banks, the video card in slot E) and the MMU.
 
 adb.h, ncr5380.h, rtc.h (the clock and XPRAM) and macii_slotrom.h (the card's declaration ROM and
 its driver) are new code written for pico-mac, not taken from other projects. asc.h (the Apple Sound

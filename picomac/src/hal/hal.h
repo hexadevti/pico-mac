@@ -19,6 +19,7 @@ enum : uint8_t {
   KEY_F1 = 0x81, KEY_F2, KEY_F3, KEY_F4, KEY_F5,
   KEY_F6 = 0x86, KEY_F7, KEY_F8, KEY_F9, KEY_F10 = 0x90,
   KEY_ALT = 0xA1, KEY_SHIFT_L = 0xA2, KEY_SHIFT_R = 0xA3, KEY_SYM = 0xA4, KEY_CTRL = 0xA5,
+  KEY_MAC_CTRL = 0xA6,   // the Mac's own Control key (the web page's; KEY_CTRL is Command)
   KEY_ESC = 0xB1, KEY_LEFT = 0xB4, KEY_UP = 0xB5, KEY_DOWN = 0xB6, KEY_RIGHT = 0xB7,
   KEY_CAPS = 0xC1,
   KEY_BREAK = 0xD0, KEY_INSERT = 0xD1, KEY_HOME = 0xD2, KEY_DEL = 0xD4, KEY_END = 0xD5,
@@ -98,3 +99,25 @@ uint32_t hal_audio_queued_us();            // sound written but not yet played
 // ---------------------------------------------------------------------------------------------
 bool        hal_sd_mounted();
 const char *hal_sd_root();                 // "/sd" on the P4, the sdcard folder on the desktop
+
+#if defined(EMU_WEB)
+// ---------------------------------------------------------------------------------------------
+// The browser build (web/src/hal_web.cpp): the page shows the Mac at its own resolution, not
+// through the 320x320 panel, and draws the menus itself as touch screens.
+// ---------------------------------------------------------------------------------------------
+// The Mac's whole picture, RGB565 (w x h, stride in pixels, at most 1280x1024).
+void hal_web_pc_frame(const uint16_t *px, int w, int h, int stride);
+// A status line over the picture: slot 0 the 2 s note, 1 the FPS meter; null or "" clears it.
+void hal_web_status(int slot, const char *text);
+// The menu bridge. ui.cpp publishes each screen as JSON and gets a sequence number; the page
+// answers that number with a key (ENTER, LEFT, ESC, ...) and the row it was for.
+uint32_t hal_web_ui_show(const char *json);
+bool hal_web_ui_take(uint32_t seq, int *key, int *sel);
+const char *hal_web_ui_text();               // an edit's text, as the page left it (UTF-8)
+void hal_web_ui_pc();                        // a Mac frame runs: the page shows the Mac again
+// The page's Files screen (upload, receive from a PC, download, delete); returns once it is closed.
+void hal_web_files();
+// The page's pointer since the last call: dx/dy the touchpad's moves (Mac pixels, +y down), x/y
+// a position the finger touched (Mac pixels; -1 when none came) and the button (1 down).
+bool hal_web_mouse(int *dx, int *dy, int *x, int *y, int *button);
+#endif

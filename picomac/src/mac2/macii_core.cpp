@@ -56,29 +56,53 @@
 #include <vector>
 #include "../mac/umac/keymap.h"   // MKC_*: ADB key codes
 #include "../mac/mac_snapshot.h"
+#include "../mac/mac_drives.h"
 #include "macii_bus.h"
 
 extern "C" {
+#if defined(MACII_IICI)
+#include "m68k030.h"
+#define MACIICI_MMU_API_ONLY
+#include "maciici_mmu.h"
+#define m68kXi_static_instruction_jump_table m68k030i_static_instruction_jump_table
+#else
 #include "m68k020.h"
+#define m68kXi_static_instruction_jump_table m68k020i_static_instruction_jump_table
+#endif
 // Musashi's opcode table (m68kops.c): 256 KB of pointers, in flash.
-extern void (*const m68k020i_static_instruction_jump_table[0x10000])(void);
+extern void (*const m68kXi_static_instruction_jump_table[0x10000])(void);
 }
 
 extern const EmuCore kMacII;
 
 namespace {
 
+#if defined(MACII_IICI)
+// The IIci: a 68030 at 25 MHz (32 times the VIA's 783.36 kHz), a 512 KB ROM.
+constexpr uint32_t kCpuHz = 25067520;
+constexpr uint32_t kFrameCycles = 416749;           // kCpuHz / 60.15
+constexpr uint32_t kViaDiv = 32;                    // CPU cycles per VIA tick
+constexpr uint32_t kRomSize = 512 * 1024;
+const uint32_t kRamSizes[RAM2_COUNT] = { 4u << 20, 8u << 20, 16u << 20, 32u << 20 };
+const char *const kRamNames[RAM2_COUNT] = { "4 MB", "8 MB", "16 MB", "32 MB" };
+#define g_romPath g_settings.romPathIIci
+#define g_ramIndex g_settings.ramIIci
+constexpr const char *kMachineName = "Mac IIci";
+#else
 constexpr uint32_t kCpuHz = 15667200;
 constexpr uint32_t kFrameCycles = 260468;           // kCpuHz / 60.15
 constexpr uint32_t kViaDiv = 20;                    // CPU cycles per VIA tick
+constexpr uint32_t kRomSize = 256 * 1024;
+const uint32_t kRamSizes[RAM2_COUNT] = { 1u << 20, 2u << 20, 4u << 20, 8u << 20 };
+const char *const kRamNames[RAM2_COUNT] = { "1 MB", "2 MB", "4 MB", "8 MB" };
+#define g_romPath g_settings.romPathII
+#define g_ramIndex g_settings.ramII
+constexpr const char *kMachineName = "Mac II";
+#endif
 constexpr uint32_t kSliceMax = 4096;                // CPU cycles per m68k_execute at most
 constexpr uint32_t kRate = 22255;
 constexpr int kSamples = 370;                       // a frame of sound
 constexpr int kStripH = 10;
-constexpr uint32_t kRomSize = 256 * 1024;
-
-const uint32_t kRamSizes[RAM2_COUNT] = { 1u << 20, 2u << 20, 4u << 20, 8u << 20 };
-const char *const kRamNames[RAM2_COUNT] = { "1 MB", "2 MB", "4 MB", "8 MB" };
 
 // --- machine ------------------------------------------------------------------------------------
 uint8_t *s_ram = nullptr;
@@ -92,7 +116,59 @@ bool s_running = false;
 char s_error[96];
 bool s_overlay = true;              // the ROM at 0 after reset
 bool s_addr32 = false;              // 24-bit mode after reset
+#if defined(MACII_IICI)
+void updateIrq();
+// The IIci's RBV in place of VIA2 (as MAME's pseudovia): no timers, no shift register. Register
+// offsets (address & 0x13): 0x00 port B, 0x01 config, 0x02 slot interrupts (active low: 0x08 slot C,
+// 0x10 D, 0x20 E, 0x40 built-in video), 0x03 the interrupt flags (0x02 any slot, 0x08 SCSI, 0x10 ASC,
+// 0x80 any), 0x10 video (depth, monitor sense in bits 3-5), 0x12 slot enable, 0x13 interrupt enable.
+// With no monitor on the built-in port (sense 7), the ROM leaves its video off.
+struct Rbv {
+  uint8_t r[0x14];
+  void reset() { memset(r, 0, sizeof r); r[2] = 0x7F; r[3] = 0x1B; }
+  bool irqOut() const { return (r[3] & 0x80) != 0; }
+  uint8_t ifr() const { return r[3]; }
+  uint8_t ier() const { return r[0x13]; }
+  uint8_t portB() const { return r[0]; }
+  void recalc() {
+    if (~r[2] & 0x78 & r[0x12]) r[3] |= 0x02; else r[3] &= ~0x02;
+    const uint8_t f = r[3] & r[0x13] & 0x1B;
+    if (f) r[3] = f | 0x80; else r[3] &= 0x7F;
+    updateIrq();
+  }
+  // A slot's interrupt line (bit: 0x08 C .. 0x20 E, 0x40 built-in video), true = asserted.
+  void slot(uint8_t bit, bool on) {
+    if (on) r[2] &= (uint8_t)~bit; else r[2] |= bit;
+    recalc();
+  }
+  void asc() { r[3] |= 0x10; recalc(); }
+  uint8_t read(uint32_t off) const {
+    off &= 0x13;
+    if (off == 0x10) return (uint8_t)((r[0x10] & ~0x38) | 0x38);   // monitor sense 7: none
+    if (off == 0x12 || off == 0x13) return r[off] & 0x7F;
+    return r[off];
+  }
+  void write(uint32_t off, uint8_t v) {
+    off &= 0x13;
+    switch (off) {
+      case 0x02: r[2] |= v & 0x40; break;
+      case 0x03: r[3] &= (uint8_t)~(v & 0x7F); break;
+      case 0x12: case 0x13:
+        if (off == 0x13 && v == 0xFF) { r[0x13] = 0x1F; break; }   // the IIci's POST writes this
+        if (v & 0x80) r[off] |= v & 0x7F; else r[off] &= (uint8_t)~(v & 0x7F);
+        break;
+      default: r[off] = v;
+    }
+    recalc();
+  }
+};
+Via6522 s_via1;
+Rbv s_rbv;
+constexpr uint32_t kCardSlot = 0xE;         // the IIci's slots are C, D and E
+#else
 Via6522 s_via1, s_via2;
+constexpr uint32_t kCardSlot = 9;
+#endif
 AdbBus s_adb;
 Ncr5380 s_scsi;                     // at 0x50F10000, a register every 0x10 bytes
 Asc s_asc;                          // at 0x50F14000 (asc.h)
@@ -104,7 +180,8 @@ uint64_t s_cycles = 0;              // CPU cycles before the current slice
 bool s_inSlice = false, s_sliceEnded = false;
 int s_sliceEndedAt = 0;
 uint64_t s_viaBase = 0, s_cycBase = 0;   // the VIA time at s_cycBase (speed changes rebase)
-int s_speed = 1;
+int s_speed = 4;                         // the 68020's speed in quarters of the real one (4 = 1x)
+uint64_t s_runCycles = 0;                // the cycles run (the FPS meter's, as Max varies)
 
 uint64_t cyclesNow() {
   if (!s_inSlice) return s_cycles;
@@ -119,20 +196,59 @@ void endSlice() {
   }
 }
 
-uint64_t viaAt(uint64_t cyc) { return s_viaBase + (cyc - s_cycBase) / (kViaDiv * (uint64_t)s_speed); }
-uint64_t cyclesAtVia(uint64_t t) { return s_cycBase + (t - s_viaBase) * kViaDiv * (uint64_t)s_speed; }
+uint64_t viaAt(uint64_t cyc) { return s_viaBase + (cyc - s_cycBase) * 4 / (kViaDiv * (uint64_t)s_speed); }
+// The first cycle at which viaAt reaches t (rounded up).
+uint64_t cyclesAtVia(uint64_t t) { return s_cycBase + ((t - s_viaBase) * kViaDiv * (uint64_t)s_speed + 3) / 4; }
 uint64_t viaNow() { return viaAt(cyclesNow()); }
 
-void setSpeed(int mult) {
+// The CPU speed setting (the startup's): 1x-4x, or 5 = Max (maxSpeedStep). The P4 can't run a Mac
+// II faster than real time, so it is always 1x there. The VIAs stay real time (viaAt), so only the
+// 68020 runs faster.
+#if defined(ESP_PLATFORM)
+constexpr bool kHasSpeed = false;
+#else
+constexpr bool kHasSpeed = true;
+#endif
+constexpr int kSpeedMax = 5;             // the setting's "Max"
+constexpr int kMaxQuarters = 64;         // Max stops at 16x
+int settingSpeed() {
+  if (!kHasSpeed) return 1;
+  return g_settings.speed < 1 ? 1 : g_settings.speed > kSpeedMax ? kSpeedMax : g_settings.speed;
+}
+
+void setSpeed(int quarters) {
   const uint64_t c = cyclesNow();
   s_viaBase = viaAt(c);
   s_cycBase = c;
-  s_speed = mult < 1 ? 1 : mult;
+  s_speed = quarters < 4 ? 4 : quarters > kMaxQuarters ? kMaxQuarters : quarters;
+}
+
+// The setting, at once (Max goes on from the speed it has).
+void applySpeedSetting() { setSpeed(settingSpeed() == kSpeedMax ? s_speed : settingSpeed() * 4); }
+
+// Max: the 68020 as fast as this computer or phone allows. The frame's own work (all but the wait
+// for the sound) is held near kBusyUs of the 16.6 ms, leaving the rest for the picture and the
+// browser. Up a quarter every 4 frames, down at once when the work or the sound queue says so.
+void maxSpeedStep(uint32_t busyUs, uint32_t queuedUs) {
+  constexpr float kBusyUs = 11500.0f;
+  static float avg = 0;
+  static uint32_t n = 0;
+  if (settingSpeed() != kSpeedMax) { avg = 0; return; }
+  if (busyUs > 200000) return;                     // back from the menu, a file dialog...
+  avg = avg ? avg + ((float)busyUs - avg) * 0.15f : (float)busyUs;
+  int q = s_speed;
+  if (queuedUs < 20000 || avg > kBusyUs * 1.05f) q -= q / 16 > 1 ? q / 16 : 1;
+  else if (avg < kBusyUs * 0.85f && ++n % 4 == 0) q++;
+  if (q != s_speed) setSpeed(q);
 }
 
 // --- interrupts: VIA1 level 1, VIA2 level 2 (SCC 4, later) -------------------------------------
 void updateIrq() {
+#if defined(MACII_IICI)
+  const int level = s_rbv.irqOut() ? 2 : s_via1.irqOut() ? 1 : 0;
+#else
   const int level = s_via2.irqOut() ? 2 : s_via1.irqOut() ? 1 : 0;
+#endif
   if (level == s_irqLevel) return;
   s_irqLevel = level;
   m68k_set_irq(level);
@@ -173,8 +289,13 @@ void cardReset() {
 }
 
 // Slot 9's interrupt: VIA2 port A bit 0 low, and CA1 (any slot) flagged.
+// The IIci: the RBV's slot E line, a level, low while the VBL is pending and enabled.
 void cardIrq() {
+#if defined(MACII_IICI)
+  s_rbv.slot(0x20, s_vblEnable && s_vblPending);
+#else
   if (s_vblEnable && s_vblPending) s_via2.pulse(Via6522::CA1);
+#endif
 }
 
 uint32_t cardReg(uint32_t off) {
@@ -197,8 +318,13 @@ void cardWriteReg(uint32_t off, uint32_t v) {
     case 0x08: s_base = v & (kVramSize - 1); break;
     case 0x0C: s_clutIndex = (uint8_t)v; return;
     case 0x10: s_clut[s_clutIndex++] = v & 0xFFFFFF; break;
+#if defined(MACII_IICI)
+    case 0x14: s_vblEnable = v & 1; cardIrq(); return;
+    case 0x18: s_vblPending = false; cardIrq(); return;
+#else
     case 0x14: s_vblEnable = v & 1; return;
     case 0x18: s_vblPending = false; return;
+#endif
     default: return;
   }
   s_vramDirty = true;
@@ -244,6 +370,332 @@ extern "C" void opCountDump();
 #endif
 void fastUpdate();
 
+// Reads and writes of 1, 2 or 4 bytes (big-endian). RAM and ROM take the fast path.
+template <int N>
+inline uint32_t rd(const uint8_t *m) {
+  if (N == 1) return m[0];
+  if (N == 2) return (uint32_t)m[0] << 8 | m[1];
+  return (uint32_t)m[0] << 24 | (uint32_t)m[1] << 16 | (uint32_t)m[2] << 8 | m[3];
+}
+
+template <int N>
+inline void wr(uint8_t *m, uint32_t v) {
+  if (N == 1) { m[0] = (uint8_t)v; return; }
+  if (N == 2) { m[0] = (uint8_t)(v >> 8); m[1] = (uint8_t)v; return; }
+  m[0] = (uint8_t)(v >> 24); m[1] = (uint8_t)(v >> 16); m[2] = (uint8_t)(v >> 8); m[3] = (uint8_t)v;
+}
+
+// Our card in slot kCardSlot: its declaration ROM at the top of the slot, VRAM and registers in
+// the first MB, repeated across the slot (32-Bit QuickDraw draws at 0xFs900000).
+template <int N>
+bool cardRead(uint32_t p, uint32_t *out) {
+  if (((p >> 24) & 0xF) != kCardSlot) return false;
+  const uint32_t full = p & 0xFFFFFF;
+  if (full >= 0x1000000u - slotrom::kSize) {
+    uint32_t v = 0;
+    for (int i = 0; i < N; i++) v = v << 8 | s_slotRom[(full + i - (0x1000000u - slotrom::kSize)) & (slotrom::kSize - 1)];
+    *out = v;
+    return true;
+  }
+  const uint32_t off = full & 0xFFFFF;
+  if (off + N <= kVramSize) { *out = rd<N>(s_vram + off); return true; }
+  if ((off & ~0xFFu) == 0x80000) {
+    *out = N == 4 ? cardReg(off) : N == 2 ? cardReg(off) >> (off & 2 ? 0 : 16) & 0xFFFF : cardReg(off) >> (8 * (3 - (off & 3))) & 0xFF;
+    return true;
+  }
+  return false;
+}
+
+template <int N>
+bool cardWrite(uint32_t p, uint32_t v) {
+  if (((p >> 24) & 0xF) != kCardSlot) return false;
+  const uint32_t off = p & 0xFFFFF;
+  if (off + N <= kVramSize) { wr<N>(s_vram + off, v); s_vramBlk[off >> kVramBlkShift] = 1; s_vramAny = true; return true; }
+  if ((off & ~0xFFu) == 0x80000 && N == 4) { cardWriteReg(off, v); return true; }
+  return false;
+}
+
+#if defined(MACII_IICI)
+// --- the IIci's bus: the 68030's PMMU, then the physical map --------------------------------------
+// Physical: RAM from 0 (the ROM there while the overlay is on), the ROM at 0x40000000 (512 KB,
+// repeated), I/O at 0x50000000 (repeated every 0x40000), the slots at 0xFs000000 (our card in E).
+// The PMMU (maciici_mmu.h has its instructions): TC, SRP, CRP, TT0, TT1 and MMUSR; the walk of the
+// tables follows the MC68030 manual (and MAME). Simplified: one address space (the TLB does not tell
+// supervisor from user), no limits, no bus errors (a fault is logged and reads 0).
+struct Mmu { uint64_t srp, crp; uint32_t tc, tt0, tt1; uint16_t sr; };
+Mmu s_mmu;
+bool s_mmuOn = false;
+uint32_t s_mmuFaults = 0;
+
+void tlbFlush() {
+  for (int i = 0; i < MACIICI_TLB; i++) { macii_fast.rtag[i] = macii_fast.wtag[i] = 1; }
+  macii_fast.flen = 0;
+}
+void fastUpdate() { tlbFlush(); }
+
+uint8_t ioRead(uint32_t p) {
+  const uint32_t off = p & 0x3FFFF;
+  switch (off >> 13) {
+    case 0: return s_via1.read((off >> 9) & 15, viaNow());
+    case 8: return s_scsi.read((off >> 4) & 7);
+    case 10: return s_asc.read(off);
+    case 11: return iwmAccess((off >> 9) & 15, false, 0);
+    case 0x12: return 0;                            // the Bt478 (the built-in video's DAC): off
+    case 0x13: return s_rbv.read(off);
+  }
+  unmapped("I/O read", p, p);
+  return 0;
+}
+
+void ioWrite(uint32_t p, uint8_t v) {
+  const uint32_t off = p & 0x3FFFF;
+  switch (off >> 13) {
+    case 0: s_via1.write((off >> 9) & 15, v, viaNow()); return;
+    case 8: s_scsi.write((off >> 4) & 7, v); return;
+    case 10: if (s_asc.write(off, v)) s_rbv.asc(); return;
+    case 11: iwmAccess((off >> 9) & 15, true, v); return;
+    case 0x12: return;
+    case 0x13: s_rbv.write(off, v); return;
+  }
+  unmapped("I/O write", p, p);
+}
+
+// The IIci's RAM is two banks of four SIMMs: A at 0, B at 0x04000000, each 64 MB of space with its
+// SIMMs mirrored over it (the ROM sizes a bank by that mirror, and its MMU tables then make the two
+// look contiguous). 4 MB = A only (1 MB SIMMs), 8 = A + B, 16 = A (4 MB SIMMs), 32 = A + B. Host:
+// bank A, then bank B, in s_ram.
+uint32_t bankA() { return s_ramSize == (8u << 20) ? 4u << 20 : s_ramSize == (32u << 20) ? 16u << 20 : s_ramSize; }
+// The host byte of physical RAM address p (an access never crosses a 4 KB page), or null.
+inline uint8_t *ramHost(uint32_t p) {
+  const uint32_t a = bankA();
+  if (p < 0x04000000u) return a ? s_ram + (p & (a - 1)) : nullptr;
+  if (p < 0x08000000u && s_ramSize > a) return s_ram + a + (p & (s_ramSize - a - 1));
+  return nullptr;
+}
+
+template <int N>
+uint32_t physRead(uint32_t p) {
+  switch (p >> 28) {
+    case 0: case 1: case 2: case 3:
+      if (s_overlay) return rd<N>(s_rom + (p & (kRomSize - 1)));
+      if (uint8_t *h = ramHost(p)) return rd<N>(h);
+      break;
+    case 4:
+      if (s_overlay) { s_overlay = false; fastUpdate(); }
+      return rd<N>(s_rom + (p & (kRomSize - 1)));
+    case 5: {
+      uint32_t v = 0;
+      for (int i = 0; i < N; i++) v = v << 8 | ioRead(p + i);
+      return v;
+    }
+    case 0xF: {
+      uint32_t v;
+      if (cardRead<N>(p, &v)) return v;
+      break;
+    }
+  }
+  unmapped(N == 1 ? "read8" : N == 2 ? "read16" : "read32", p, p);
+  return 0;
+}
+
+template <int N>
+void physWrite(uint32_t p, uint32_t v) {
+  switch (p >> 28) {
+    case 0: case 1: case 2: case 3:
+      if (uint8_t *h = ramHost(p)) { wr<N>(h, v); return; }
+      break;
+    case 4:
+      if (s_overlay) { s_overlay = false; fastUpdate(); }
+      return;
+    case 5:
+      for (int i = 0; i < N; i++) ioWrite(p + i, (uint8_t)(v >> (8 * (N - 1 - i))));
+      return;
+    case 0xF:
+      if (cardWrite<N>(p, v)) return;
+      break;
+  }
+  unmapped(N == 1 ? "write8" : N == 2 ? "write16" : "write32", p, p);
+}
+
+// A table descriptor's long: RAM or ROM, no side effects.
+uint32_t descRead(uint32_t p) {
+  if (p >> 28 <= 3 && !s_overlay) { uint8_t *h = ramHost(p); return h ? rd<4>(h) : 0; }
+  if (p >> 28 == 4 || (p >> 28 <= 3 && s_overlay)) return rd<4>(s_rom + (p & (kRomSize - 1)));
+  return 0;
+}
+void descWrite(uint32_t p, uint32_t v) {
+  if (p >> 28 <= 3 && !s_overlay) if (uint8_t *h = ramHost(p)) wr<4>(h, v);
+}
+
+bool ttMatch(uint32_t tt, uint32_t a, int fc, bool write) {
+  if (!(tt & 0x8000)) return false;
+  const uint32_t ignore = (tt << 8) & 0xFF000000u;
+  if (((a ^ tt) & 0xFF000000u & ~ignore) != 0) return false;
+  const int fcMask = tt & 7, fcBase = (tt >> 4) & 7;
+  if ((fc & ~fcMask) != (fcBase & ~fcMask)) return false;
+  if (!(tt & 0x100) && (((tt >> 9) & 1) != (write ? 0u : 1u))) return false;
+  return true;
+}
+
+int mmuFc() { return (m68k_get_reg(nullptr, M68K_REG_SR) & 0x2000) ? 5 : 1; }
+
+// The table walk for a (function code fc). update: set U (and M on a write) as the 68030 does.
+// maxLevel: PTEST's level (0 = all). The MMUSR comes back in *sr (W 0x800, I 0x400, M 0x200,
+// T 0x40, N = the levels). false: no translation (invalid, or a write to a write-protected page).
+bool mmuWalk(uint32_t a, int fc, bool write, bool update, int maxLevel, uint32_t *pa, uint16_t *sr) {
+  *sr = 0;
+  if (ttMatch(s_mmu.tt0, a, fc, write) || ttMatch(s_mmu.tt1, a, fc, write)) { *pa = a; *sr = 0x40; return true; }
+  const uint32_t tc = s_mmu.tc;
+  const uint64_t root = ((tc & 0x02000000) && (fc & 4)) ? s_mmu.srp : s_mmu.crp;
+  uint32_t dt = (uint32_t)(root >> 32) & 3, tbl = (uint32_t)root & 0xFFFFFFF0u;
+  int shift = (tc >> 16) & 15;                      // IS: the top bits ignored
+  const int tis[4] = { (int)(tc >> 12) & 15, (int)(tc >> 8) & 15, (int)(tc >> 4) & 15, (int)tc & 15 };
+  bool wp = false;
+  auto low = [&](int s) { return s >= 32 ? 0u : a & (0xFFFFFFFFu >> s); };
+  if (dt == 1) { *pa = ((uint32_t)root & 0xFFFFFF00u) + low(shift); return true; }
+  for (int lv = 0; lv < 4; lv++) {
+    const int ti = tis[lv];
+    if (dt == 0 || ti == 0) { *sr |= 0x0400 | lv; return false; }
+    const uint32_t idx = (uint32_t)(((uint64_t)a << shift) >> (32 - ti)) & ((1u << ti) - 1);
+    shift += ti;
+    const bool isLong = dt == 3;
+    const uint32_t da = tbl + idx * (isLong ? 8 : 4);
+    const uint32_t d0 = descRead(da);
+    const uint32_t addr = isLong ? descRead(da + 4) : d0;
+    uint32_t ddt = d0 & 3;
+    wp |= (d0 & 4) != 0;
+    const bool stop = maxLevel && lv + 1 >= maxLevel;   // PTEST's level reached
+    const bool last = lv == 3 || tis[lv + 1] == 0;
+    if (ddt == 0) { *sr |= 0x0400 | (lv + 1); return false; }
+    uint32_t pda = da, pd0 = d0, paddr = addr;       // the page descriptor (perhaps indirect)
+    if (ddt != 1 && last) {
+      // An indirect descriptor: it points to the page descriptor.
+      pda = addr & ~3u;
+      pd0 = descRead(pda);
+      paddr = ddt == 3 ? descRead(pda + 4) : pd0;
+      if ((pd0 & 3) != 1) { *sr |= 0x0400 | (lv + 1); return false; }
+      wp |= (pd0 & 4) != 0;
+      ddt = 1;
+    }
+    if (ddt == 1) {
+      if (update) {
+        uint32_t nd = pd0 | 0x08;
+        if (write && !wp) nd |= 0x10;
+        if (nd != pd0) descWrite(pda, nd);
+      }
+      if (wp) *sr |= 0x0800;
+      if ((pd0 & 0x10) || (write && !wp && update)) *sr |= 0x0200;
+      *sr |= (uint16_t)(lv + 1);
+      *pa = (paddr & 0xFFFFFF00u) + low(shift);
+      return !(write && wp);
+    }
+    if (stop) { *sr |= (uint16_t)(lv + 1); *pa = 0; return true; }
+    if (update && !(d0 & 0x08)) descWrite(da, d0 | 0x08);
+    tbl = addr & 0xFFFFFFF0u;
+    dt = ddt;
+  }
+  *sr |= 0x0400 | 4;
+  return false;
+}
+
+// A logical address -> a physical one (0x60000000 + the page offset when there is no mapping: it
+// reads 0 and logs). *page: true when the whole 4 KB page maps alike (the TLB may keep it).
+uint32_t translate(uint32_t a, bool write, bool *page) {
+  *page = true;
+  if (!s_mmuOn) return a;
+  uint32_t pa;
+  uint16_t sr;
+  if (!mmuWalk(a, mmuFc(), write, true, 0, &pa, &sr)) {
+    if (s_mmuFaults++ < 32)
+      hal_log("maciici: MMU %s fault at %08x (mmusr %04x) pc %08x", write ? "write" : "read", (unsigned)a, sr,
+              (unsigned)m68k_get_reg(nullptr, M68K_REG_PPC));
+    *page = false;
+    return 0x60000000u | (a & 0xFFF);
+  }
+  if (((s_mmu.tc >> 20) & 15) < 12 && !(sr & 0x40)) *page = false;   // pages under 4 KB
+  return pa;
+}
+
+// The host bytes of the 4 KB physical page p (page aligned) for the TLB, or null. Writes: RAM only
+// (the card's VRAM goes the slow way: busWrite marks what the drawing job redraws).
+uint8_t *hostPage(uint32_t p, bool write) {
+  if (p >> 28 <= 3) {
+    if (s_overlay) return write ? nullptr : s_rom + (p & (kRomSize - 1));
+    return ramHost(p);
+  }
+  if (p >> 28 == 4) return write ? nullptr : s_rom + (p & (kRomSize - 1));
+  return nullptr;
+}
+
+void tlbFill(uint32_t a, uint32_t p, bool write) {
+  uint8_t *h = hostPage(p & ~0xFFFu, write);
+  if (!h) return;
+  const unsigned i = MACIICI_SLOT(a);
+  if (write) {
+    macii_fast.wtag[i] = a & ~0xFFFu;
+    macii_fast.whost[i] = h;
+  }
+  macii_fast.rtag[i] = a & ~0xFFFu;
+  macii_fast.rhost[i] = h;
+}
+
+template <int N>
+uint32_t busRead(uint32_t addr) {
+  if (N > 1 && (addr & 0xFFF) > 0x1000u - N) {      // across two pages: byte by byte
+    uint32_t v = 0;
+    for (int i = 0; i < N; i++) v = v << 8 | busRead<1>(addr + i);
+    return v;
+  }
+  bool page;
+  const uint32_t p = translate(addr, false, &page);
+  const uint32_t v = physRead<N>(p);
+  if (page) tlbFill(addr, p, false);
+  return v;
+}
+
+template <int N>
+void busWrite(uint32_t addr, uint32_t v) {
+  if (N > 1 && (addr & 0xFFF) > 0x1000u - N) {
+    for (int i = 0; i < N; i++) busWrite<1>(addr + i, (v >> (8 * (N - 1 - i))) & 0xFF);
+    return;
+  }
+  bool page;
+  const uint32_t p = translate(addr, true, &page);
+  physWrite<N>(p, v);
+  if (page) tlbFill(addr, p, true);
+}
+
+// The fetch window: the cached page the PC is in (busRead has just filled it).
+void fetchWindow(uint32_t a) {
+  macii_fast.flen = 0;
+  const unsigned i = MACIICI_SLOT(a);
+  if (macii_fast.rtag[i] != (a & ~0xFFFu)) return;
+  macii_fast.fbase = macii_fast.rhost[i];
+  macii_fast.flo = a & ~0xFFFu;
+  macii_fast.flen = 0xFFD;
+}
+
+// A logical address as the CPU sees it now, without touching the U/M bits (the debugger, gHost).
+uint32_t phys(uint32_t a) {
+  if (!s_mmuOn) return a;
+  uint32_t pa;
+  uint16_t sr;
+  return mmuWalk(a, mmuFc(), false, false, 0, &pa, &sr) ? pa : 0x60000000u;
+}
+
+// A RAM pointer for [a, a+len) as the CPU sees it, or null (not all in RAM, or not contiguous).
+uint8_t *gHost(uint32_t a, uint32_t len) {
+  if (s_overlay || len == 0) return nullptr;
+  const uint32_t p = phys(a);
+  uint8_t *h = (p >> 28) <= 3 ? ramHost(p) : nullptr;
+  if (!h || h + len > s_ram + s_ramSize) return nullptr;
+  for (uint32_t pg = (a & ~0xFFFu) + 0x1000; pg - a < len; pg += 0x1000) {
+    const uint32_t q = phys(pg);
+    if ((q >> 28) > 3 || ramHost(q) != h + (pg - a)) return nullptr;
+  }
+  return h;
+}
+#else
 // A CPU address -> a physical (32-bit) one.
 inline uint32_t phys(uint32_t a) {
   if (s_addr32) return a;
@@ -291,21 +743,6 @@ void ioWrite(uint32_t p, uint8_t v) {
   unmapped("I/O write", p, p);
 }
 
-// Reads and writes of 1, 2 or 4 bytes (big-endian). RAM and ROM take the fast path.
-template <int N>
-inline uint32_t rd(const uint8_t *m) {
-  if (N == 1) return m[0];
-  if (N == 2) return (uint32_t)m[0] << 8 | m[1];
-  return (uint32_t)m[0] << 24 | (uint32_t)m[1] << 16 | (uint32_t)m[2] << 8 | m[3];
-}
-
-template <int N>
-inline void wr(uint8_t *m, uint32_t v) {
-  if (N == 1) { m[0] = (uint8_t)v; return; }
-  if (N == 2) { m[0] = (uint8_t)(v >> 8); m[1] = (uint8_t)v; return; }
-  m[0] = (uint8_t)(v >> 24); m[1] = (uint8_t)(v >> 16); m[2] = (uint8_t)(v >> 8); m[3] = (uint8_t)v;
-}
-
 template <int N>
 uint32_t busRead(uint32_t addr) {
   const uint32_t p = phys(addr);
@@ -324,20 +761,11 @@ uint32_t busRead(uint32_t addr) {
       for (int i = 0; i < N; i++) v = v << 8 | ioRead(p + i);
       return v;
     }
-    case 0xF:
-      if (((p >> 24) & 0xF) == 9) {
-        const uint32_t full = p & 0xFFFFFF;
-        if (full >= 0x1000000u - slotrom::kSize) {
-          uint32_t v = 0;
-          for (int i = 0; i < N; i++) v = v << 8 | s_slotRom[(full + i - (0x1000000u - slotrom::kSize)) & (slotrom::kSize - 1)];
-          return v;
-        }
-        const uint32_t off = full & 0xFFFFF;          // the first MB repeats (cardOffset)
-        if (off + N <= kVramSize) return rd<N>(s_vram + off);
-        if ((off & ~0xFFu) == 0x80000) return N == 4 ? cardReg(off) : N == 2 ? cardReg(off) >> (off & 2 ? 0 : 16) & 0xFFFF
-                                                                             : cardReg(off) >> (8 * (3 - (off & 3))) & 0xFF;
-      }
+    case 0xF: {
+      uint32_t v;
+      if (cardRead<N>(p, &v)) return v;
       break;
+    }
   }
   unmapped(N == 1 ? "read8" : N == 2 ? "read16" : "read32", addr, p);
   return 0;
@@ -350,16 +778,17 @@ void busWrite(uint32_t addr, uint32_t v) {
     case 0: case 1: case 2: case 3:
       if (p + N <= s_ramSize) { wr<N>(s_ram + p, v); return; }
       break;
-    case 4: if (s_overlay) { s_overlay = false; fastUpdate(); } return;   // ROM
+    case 4:   // ROM
+      if (s_overlay) { s_overlay = false; fastUpdate(); }
+      // 8 MB fills the 24-bit RAM space, and a write past its end wraps to 0: the ROM's start-up
+      // test checks that (a write at 0x800000 must show at 0) and stops in its test loop otherwise.
+      if (!s_addr32 && s_ramSize == 0x800000u && (addr & 0xF00000u) == 0x800000u) wr<N>(s_ram + (addr & 0xFFFFFu), v);
+      return;
     case 5:
       for (int i = 0; i < N; i++) ioWrite(p + i, (uint8_t)(v >> (8 * (N - 1 - i))));   // dynamic bus sizing
       return;
     case 0xF:
-      if (((p >> 24) & 0xF) == 9) {
-        const uint32_t off = p & 0xFFFFF;              // the first MB repeats (cardOffset)
-        if (off + N <= kVramSize) { wr<N>(s_vram + off, v); s_vramBlk[off >> kVramBlkShift] = 1; s_vramAny = true; return; }
-        if ((off & ~0xFFu) == 0x80000 && N == 4) { cardWriteReg(off, v); return; }
-      }
+      if (cardWrite<N>(p, v)) return;
       break;
   }
   unmapped(N == 1 ? "write8" : N == 2 ? "write16" : "write32", addr, p);
@@ -390,6 +819,15 @@ void fetchWindow(uint32_t a) {
   }
 }
 
+// A RAM pointer for [a, a+len) as the CPU sees it, or null (not all in RAM, or not contiguous).
+uint8_t *gHost(uint32_t a, uint32_t len) {
+  const uint32_t p = phys(a), q = phys(a + len - 1);
+  if (s_overlay || len == 0 || q - p != len - 1 || (p >> 28) > 3 || q >= s_ramSize) return nullptr;
+  return s_ram + p;
+}
+
+#endif   // MACII_IICI
+
 // --- the card's driver (macii_slotrom.h): Open, Control, Status, Close and the VBL ack ----------
 // Guest memory as the CPU sees it (the driver passes addresses valid in the current mode).
 uint32_t gRead8(uint32_t a) { return busRead<1>(a); }
@@ -398,13 +836,6 @@ uint32_t gRead32(uint32_t a) { return busRead<4>(a); }
 void gWrite8(uint32_t a, uint32_t v) { busWrite<1>(a, v); }
 void gWrite16(uint32_t a, uint32_t v) { busWrite<2>(a, v); }
 void gWrite32(uint32_t a, uint32_t v) { busWrite<4>(a, v); }
-// A RAM pointer for [a, a+len) as the CPU sees it, or null (not all in RAM, or not contiguous).
-uint8_t *gHost(uint32_t a, uint32_t len) {
-  const uint32_t p = phys(a), q = phys(a + len - 1);
-  if (s_overlay || len == 0 || q - p != len - 1 || (p >> 28) > 3 || q >= s_ramSize) return nullptr;
-  return s_ram + p;
-}
-
 constexpr int16_t kNoErr = 0, kControlErr = -17, kStatusErr = -18;
 
 // Sets the card to a mode (spID); false if the mode is not one of ours.
@@ -472,7 +903,7 @@ int16_t driverControl(uint32_t pb, uint32_t dce) {
     case 4: return kNoErr;                           // SetGamma
     case 5: grayPage(); return kNoErr;               // GrayPage
     case 6: s_grayMode = gRead8(param) != 0; return kNoErr;   // SetGray
-    case 7: s_vblEnable = gRead8(param) == 0; return kNoErr;  // SetInterrupt (0 = on)
+    case 7: s_vblEnable = gRead8(param) == 0; cardIrq(); return kNoErr;  // SetInterrupt (0 = on)
     case 9: return kNoErr;                           // SetDefaultMode
   }
   return kControlErr;
@@ -505,12 +936,13 @@ bool driverOp(uint16_t op) {
     case slotrom::kEmulOpen:
       setMode(slotrom::kModeFirst);
       s_vblEnable = true;
+      cardIrq();
       hal_log("macii: video driver open, DCE %08x, base %08x", (unsigned)a1, (unsigned)gRead32(a1 + 0x2A));
       break;
     case slotrom::kEmulControl: d0 = driverControl(a0, a1); break;
     case slotrom::kEmulStatus: d0 = driverStatus(a0, a1); break;
-    case slotrom::kEmulClose: s_vblEnable = false; break;
-    case slotrom::kEmulVblAck: s_vblPending = false; return true;
+    case slotrom::kEmulClose: s_vblEnable = false; cardIrq(); break;
+    case slotrom::kEmulVblAck: s_vblPending = false; cardIrq(); return true;   // the IIci's line is a level
     default: return false;
   }
   m68k_set_reg(M68K_REG_D0, (uint32_t)d0);
@@ -521,7 +953,11 @@ bool driverOp(uint16_t op) {
 MacRtc s_rtc;
 constexpr uint32_t kMacEpochOffset = 2082844800u;   // 1904-01-01 to 1970-01-01, in seconds
 
+#if defined(MACII_IICI)
+std::string pramPath() { return sdPath("picomac/pramci.bin"); }
+#else
 std::string pramPath() { return sdPath("picomac/pram2.bin"); }
+#endif
 
 // The host's time in the Mac's terms (local time, from 1904), when it has a clock (as the Plus core).
 bool hostClock(uint32_t *secs) {
@@ -540,7 +976,8 @@ bool hostClock(uint32_t *secs) {
 // Slot 9's PRAM (XPRAM 0x46: the board ID, then the mode the screen starts in, spID 0x80-0x83 =
 // 1-8 bits). The Monitors control panel would change it; System 7.5.5 from the Mini vMac bundle
 // has none, so the menu's Colors row does (the Mac restarts with it).
-constexpr int kColorsByte = 0x48;
+constexpr int kSlotPram = 0x46 + 8 * (int)(kCardSlot - 9);   // the card's 8 bytes of slot PRAM
+constexpr int kColorsByte = kSlotPram + 2;
 
 void loadPram() {
   uint8_t b[260] = {};
@@ -554,7 +991,7 @@ void loadPram() {
     };
     memset(b, 0, sizeof b);
     memcpy(b, kZap, sizeof kZap);
-    b[0x46] = 0x01; b[0x47] = 0x23; b[0x48] = 0x83;   // slot 9: our board, 256 colours (kColorsByte)
+    b[kSlotPram] = 0x01; b[kSlotPram + 1] = 0x23; b[kColorsByte] = 0x83;   // our board, 256 colours
     b[0x77] = 0x01; b[0x78] = 0xFF; b[0x79] = 0xFF; b[0x7A] = 0xFF; b[0x7B] = 0xDF;
   }
   memcpy(s_rtc.xpram, b, 256);
@@ -578,7 +1015,11 @@ void savePram() {
 // --- VIA ports ----------------------------------------------------------------------------------
 // VIA1 port A inputs: as MAME's Mac II, 0x81. PA6 low = a Mac II (high = IIcx/SE/30, whose IWM
 // the ROM then looks for at +0x1C000), PA0 high for the SWIM.
+#if defined(MACII_IICI)
+uint8_t via1InA(void *) { return 0xC7; }          // MAME's IIci
+#else
 uint8_t via1InA(void *) { return 0x81; }
+#endif
 
 // VIA1 port B: PB3 = ADB /INT (input), PB4/PB5 = the ADB state (outputs), PB0-2 the RTC (rtc.h).
 uint8_t via1InB(void *) {
@@ -612,6 +1053,7 @@ void adbTick(uint64_t t) {
   else s_via1.shiftIn(b);
 }
 
+#if !defined(MACII_IICI)
 // VIA2 port A: the slot interrupts, active low (bit 0 = slot 9 ... bit 5 = slot E).
 uint8_t via2InA(void *) { return (s_vblEnable && s_vblPending) ? 0xFE : 0xFF; }
 
@@ -621,6 +1063,8 @@ void via2OutB(void *, uint8_t v) {
   const bool a32 = (v & 0x08) != 0;
   if (a32 != s_addr32) { s_addr32 = a32; fastUpdate(); }
 }
+
+#endif
 
 // --- video --------------------------------------------------------------------------------------
 // Fit: the 640x480 screen at 320x240, each pixel the average of 2x2. 1:1 pan: a window of it
@@ -728,6 +1172,25 @@ void followPointer(int visH) {
   if (s_panY < 0) s_panY = 0;
 }
 
+#if defined(EMU_WEB)
+// The page shows the Mac's own 640x480 picture, through the CLUT; the panel is never seen.
+void webFrame() {
+  static uint16_t *pic = nullptr;
+  if (!pic) pic = (uint16_t *)hal_alloc_big(kScreenW * kScreenH * 2);
+  if (!pic) return;
+  static uint8_t idx[kScreenW];
+  uint16_t pal[256];
+  for (int i = 0; i < 256; i++) pal[i] = rgb565(s_clut[i]);
+  for (int y = 0; y < kScreenH; y++) {
+    const uint32_t r = s_base + (uint32_t)y * s_rowBytes;
+    if (r + s_rowBytes > kVramSize) { memset(pic + y * kScreenW, 0, (kScreenH - y) * kScreenW * 2); break; }
+    rowIndices(s_vram + r, (int)s_depth, idx);
+    for (int x = 0; x < kScreenW; x++) pic[y * kScreenW + x] = pal[idx[x]];
+  }
+  hal_web_pc_frame(pic, kScreenW, kScreenH, kScreenW);
+}
+#endif
+
 // The drawing job (core 0 on the P4).
 void drawJob(void *) {
   if (!hal_video_ready()) return;
@@ -746,6 +1209,13 @@ void drawJob(void *) {
   const bool curAll = s_vramDirty;
   if (!s_redraw && !s_wholeLeft && !curAll && !curAny && !prevAny && !prevAll && px == s_panX && py == s_panY) return;
   s_vramDirty = false;
+#if defined(EMU_WEB)
+  prevAny = prevAll = false;
+  s_redraw = false;
+  s_wholeLeft = 0;
+  webFrame();
+  return;
+#endif
   const bool all = curAll || prevAll;
   if (!all) for (int k = 0; k < kVramBlks; k++) use[k] = (curAny && cur[k]) || (prevAny && prev[k]);
   if (curAny) memcpy(prev, cur, sizeof prev);
@@ -776,6 +1246,9 @@ void drawJob(void *) {
 
 // A line of text in the bottom strip for 2 s; null clears the strip.
 void showNote(const char *text) {
+#if defined(EMU_WEB)
+  hal_web_status(0, text);
+#endif
   const int y = PANEL_H - kStripH;
   ui::fill(0, y, PANEL_W, kStripH, 0);
   if (text) ui::text(PANEL_W / 2, y + 5, text, ui::kAccent, 1, ui::MC);
@@ -809,9 +1282,19 @@ void machineReset() {
   s_asc.reset();
   s_adbAt = UINT64_MAX;
   s_via1.reset();
+#if defined(MACII_IICI)
+  s_rbv.reset();
+  memset(&s_mmu, 0, sizeof s_mmu);
+  s_mmuOn = false;
+  s_mmuFaults = 0;
+  tlbFlush();
+  m68k_init();
+  m68k_set_cpu_type(M68K_CPU_TYPE_68030);
+#else
   s_via2.reset();
   m68k_init();
   m68k_set_cpu_type(M68K_CPU_TYPE_68020);
+#endif
   m68k_set_irq(0);
   m68k_pulse_reset();
   hal_log("macii: reset, pc %08x sp %08x", (unsigned)m68k_get_reg(nullptr, M68K_REG_PC),
@@ -819,16 +1302,22 @@ void machineReset() {
 }
 
 bool powerOn() {
-  const std::string romPath = sdPath(g_settings.romPathII.c_str());
+  const std::string romPath = sdPath(g_romPath.c_str());
   FILE *f = fopen(romPath.c_str(), "rb");
-  if (!f) { snprintf(s_error, sizeof s_error, "No ROM: put it at /%s", g_settings.romPathII.c_str()); return false; }
+  if (!f) { snprintf(s_error, sizeof s_error, "No ROM: put it at /%s", g_romPath.c_str()); return false; }
   const size_t got = fread(s_rom, 1, kRomSize, f);
   fclose(f);
-  if (got != kRomSize) { snprintf(s_error, sizeof s_error, "The ROM must be 256 KB (a Mac II ROM)"); return false; }
   const uint32_t sum = romChecksum();
+#if defined(MACII_IICI)
+  if (got != kRomSize) { snprintf(s_error, sizeof s_error, "The ROM must be 512 KB (a Mac IIci ROM)"); return false; }
+  const bool known = sum == 0x368CADFE;
+  hal_log("maciici: ROM %08x%s", (unsigned)sum, known ? "" : " (not the IIci ROM I know; trying it)");
+#else
+  if (got != kRomSize) { snprintf(s_error, sizeof s_error, "The ROM must be 256 KB (a Mac II ROM)"); return false; }
   // Mac II (two versions) and IIx/IIcx/SE/30: the ones meant to run here. Others are tried anyway.
   const bool known = sum == 0x97851DB6 || sum == 0x9779D2C4 || sum == 0x97221136;
   hal_log("macii: ROM %08x%s", (unsigned)sum, known ? "" : " (not a Mac II ROM I know; trying it)");
+#endif
   if (!sony::patchRom(s_rom, kRomSize)) { snprintf(s_error, sizeof s_error, "No .Sony driver in the ROM"); return false; }
 
   const std::string paths[sony::kDrives] = { s_diskPath, s_disk2Path };
@@ -846,14 +1335,14 @@ bool powerOn() {
             s_sony.image[i].readOnly ? ", read-only" : "");
   }
 
-  const uint32_t ram = kRamSizes[g_settings.ramII];
+  const uint32_t ram = kRamSizes[g_ramIndex];
   if (ram != s_ramSize) {
     hal_free(s_ram);
     s_ram = (uint8_t *)hal_alloc_big(ram);
     s_ramSize = s_ram ? ram : 0;
-    if (!s_ram) { snprintf(s_error, sizeof s_error, "Out of memory for %s of RAM", kRamNames[g_settings.ramII]); return false; }
+    if (!s_ram) { snprintf(s_error, sizeof s_error, "Out of memory for %s of RAM", kRamNames[g_ramIndex]); return false; }
   }
-  s_speed = 1;   // no speed setting: the P4 can't run a Mac II faster than real time
+  s_speed = settingSpeed() == kSpeedMax ? 4 : settingSpeed() * 4;   // Max starts at 1x
   machineReset();
   s_redraw = true;
   s_panX = s_panY = 0;
@@ -867,18 +1356,23 @@ int s_dbgCount = 0;
 
 // Runs `cycles` CPU cycles, in slices that end at the next VIA timer event.
 uint32_t s_slices = 0;               // m68k_execute calls (the frame log)
+
 void run(uint32_t cycles) {
   const uint64_t end = s_cycles + cycles;
   while (s_cycles < end) {
     const uint64_t t = viaAt(s_cycles);
     s_via1.tick(t);
+#if !defined(MACII_IICI)
     s_via2.tick(t);
+#endif
     adbTick(t);
     uint64_t slice = end - s_cycles;
     if (slice > kSliceMax) slice = kSliceMax;
     uint64_t ev = s_via1.nextEvent(t);
+#if !defined(MACII_IICI)
     const uint64_t ev2 = s_via2.nextEvent(t);
     if (ev2 < ev) ev = ev2;
+#endif
     if (s_adbAt != UINT64_MAX && s_adbAt - t < ev) ev = s_adbAt > t ? s_adbAt - t : 0;
     if (ev != UINT64_MAX) {
       const uint64_t at = cyclesAtVia(t + (ev ? ev : 1));
@@ -938,6 +1432,7 @@ uint8_t adbKey(uint8_t code, bool *shift) {
     case KEY_TAB: return MKC_Tab;
     case KEY_ESC: return 0x35;                      // an ADB keyboard has Esc
     case KEY_CTRL: return MKC_Command;
+    case KEY_MAC_CTRL: return 0x36;                 // ADB Control (MKC_Control, 0x3B, is an arrow here)
     case KEY_SYM: return MKC_Option;
     case KEY_SHIFT_L: case KEY_SHIFT_R: return MKC_Shift;
     // ADB's raw codes, not the Plus keyboard's virtual ones (MKC_Left is 0x7B: on ADB that is the
@@ -1094,6 +1589,42 @@ void moveMouse() {
   s_ram[0x8CE] = s_ram[0x8CF];
 }
 
+#if defined(EMU_WEB)
+// The page's pointer (hal_web_mouse): a touched spot (absolute) or the touchpad's moves, set
+// through the same globals as moveMouse, and its button through the ADB mouse. A press or
+// release that comes with a move waits one frame, so the click lands where the finger went.
+void webPointer() {
+  int dx, dy, x, y, b;
+  if (!hal_web_mouse(&dx, &dy, &x, &y, &b)) return;
+  const bool moved = dx || dy || x >= 0;
+  if (moved) {
+    const int top = (int16_t)rd16(0x834), left = (int16_t)rd16(0x836);       // CrsrPin
+    const int bottom = (int16_t)rd16(0x838), right = (int16_t)rd16(0x83A);
+    if (s_overlay || bottom <= top || right <= left || bottom > 4096 || right > 4096) {
+      if (dx || dy) s_adb.mouse(dx, dy, s_button);
+    } else {
+      const uint32_t base = s_ram[0x8CE] ? 0x828 : 0x830;
+      int v = x >= 0 ? y : (int16_t)rd16(base) + dy, h = x >= 0 ? x : (int16_t)rd16(base + 2) + dx;
+      if (v < top) v = top;
+      if (v > bottom - 1) v = bottom - 1;
+      if (h < left) h = left;
+      if (h > right - 1) h = right - 1;
+      wr16(0x828, v); wr16(0x82A, h);
+      wr16(0x82C, v); wr16(0x82E, h);
+      s_ram[0x8CE] = s_ram[0x8CF];
+    }
+  }
+  static int sent = 0;
+  static bool waited = false;
+  if (b == sent) return;
+  if (moved && !waited) { waited = true; return; }
+  waited = false;
+  sent = b;
+  s_button = b != 0;
+  s_adb.mouse(0, 0, s_button);
+}
+#endif
+
 // The coupling capacitor of the output stage (one-pole high-pass, ~20 Hz), as the Plus core.
 struct SoundFilter {
   float hpR, hpX = 0, hpY = 0;
@@ -1144,19 +1675,28 @@ SoundStretch s_stretch;
 // After the header: "MII1", the sizes of the parts (another build's layout = "another version"),
 // then the 68020's context, the core's variables, the devices, the RAM and the VRAM. Saved and
 // loaded between frames, once the menu has closed.
+#if defined(MACII_IICI)
+constexpr char kStateTag[4] = { 'M', 'I', 'C', '1' };
+#define s_via2 s_rbv                                // the RBV takes VIA2's place in the file
+#else
 constexpr char kStateTag[4] = { 'M', 'I', 'I', '1' };
+#endif
 struct Globals {
   uint64_t cycles, viaBase, cycBase, adbAt;
   int32_t speed, irqLevel;
   uint32_t depth, rowBytes, base, clut[256];
   uint8_t clutIndex, vblEnable, vblPending, mode, grayMode, overlay, addr32, iwmLines, iwmMode;
+#if defined(MACII_IICI)
+  Mmu mmu;
+  uint8_t mmuOn;
+#endif
 };
 enum { PART_CPU, PART_GLOBALS, PART_VIA, PART_ADB, PART_RTC, PART_ASC, PART_SCSI, PART_SONY, PART_RAM, PART_VRAM, PART_COUNT };
 
 void stateSizes(uint32_t *z) {
   z[PART_CPU] = m68k_context_size();
   z[PART_GLOBALS] = sizeof(Globals);
-  z[PART_VIA] = sizeof(Via6522);
+  z[PART_VIA] = sizeof(Via6522) + sizeof(s_via2);
   z[PART_ADB] = sizeof(AdbBus);
   z[PART_RTC] = sizeof(MacRtc);
   z[PART_ASC] = sizeof(Asc);
@@ -1172,11 +1712,14 @@ bool saveState(FILE *f) {
   Globals g;
   memset(&g, 0, sizeof g);
   g.cycles = s_cycles; g.viaBase = s_viaBase; g.cycBase = s_cycBase; g.adbAt = s_adbAt;
-  g.speed = s_speed; g.irqLevel = s_irqLevel;
+  g.speed = s_speed | 0x10000; g.irqLevel = s_irqLevel;   // 0x10000: in quarters
   g.depth = s_depth; g.rowBytes = s_rowBytes; g.base = s_base;
   memcpy(g.clut, s_clut, sizeof g.clut);
   g.clutIndex = s_clutIndex; g.vblEnable = s_vblEnable; g.vblPending = s_vblPending; g.mode = s_mode;
   g.grayMode = s_grayMode; g.overlay = s_overlay; g.addr32 = s_addr32; g.iwmLines = s_iwmLines; g.iwmMode = s_iwmMode;
+#if defined(MACII_IICI)
+  g.mmu = s_mmu; g.mmuOn = s_mmuOn;
+#endif
   uint8_t *cpu = (uint8_t *)malloc(z[PART_CPU]);
   uint8_t adb[sizeof(AdbBus)], sony[sony::Drives::kStateSize];
   if (!cpu) return false;
@@ -1215,7 +1758,13 @@ int loadState(FILE *f) {
   Globals g;
   uint8_t adb[sizeof(AdbBus)], sony[sony::Drives::kStateSize];
   bool ok = fread(cpu, 1, z[PART_CPU], f) == z[PART_CPU] && fread(&g, sizeof g, 1, f) == 1 &&
-            loadVia(f, s_via1) && loadVia(f, s_via2) && fread(adb, sizeof adb, 1, f) == 1 &&
+            loadVia(f, s_via1) &&
+#if defined(MACII_IICI)
+            fread((void *)&s_rbv, sizeof s_rbv, 1, f) == 1 &&
+#else
+            loadVia(f, s_via2) &&
+#endif
+            fread(adb, sizeof adb, 1, f) == 1 &&
             fread((void *)&s_rtc, sizeof s_rtc, 1, f) == 1 && fread((void *)&s_asc, sizeof s_asc, 1, f) == 1 &&
             fread((void *)&s_scsi, sizeof s_scsi, 1, f) == 1 && fread(sony, sizeof sony, 1, f) == 1 &&
             fread(s_ram, 1, s_ramSize, f) == s_ramSize && fread(s_vram, 1, kVramSize, f) == kVramSize;
@@ -1224,11 +1773,15 @@ int loadState(FILE *f) {
     s_adb.loadState(adb);
     s_sony.loadState(sony);
     s_cycles = g.cycles; s_viaBase = g.viaBase; s_cycBase = g.cycBase; s_adbAt = g.adbAt;
-    s_speed = g.speed; s_irqLevel = g.irqLevel;
+    s_speed = g.speed & 0x10000 ? g.speed & 0xFFFF : g.speed * 4; s_irqLevel = g.irqLevel;
+    if (s_speed < 4) s_speed = 4;
     s_depth = g.depth & 3; s_rowBytes = g.rowBytes; s_base = g.base & (kVramSize - 1);
     memcpy(s_clut, g.clut, sizeof s_clut);
     s_clutIndex = g.clutIndex; s_vblEnable = g.vblEnable; s_vblPending = g.vblPending; s_mode = g.mode;
     s_grayMode = g.grayMode; s_overlay = g.overlay; s_addr32 = g.addr32; s_iwmLines = g.iwmLines; s_iwmMode = g.iwmMode;
+#if defined(MACII_IICI)
+    s_mmu = g.mmu; s_mmuOn = g.mmuOn;
+#endif
     fastUpdate();
     s_vramDirty = true;
   }
@@ -1245,7 +1798,7 @@ void saveSnapshot() {
   MacSnapMachine m;
   m.disk = s_diskPath;
   m.disk2 = s_disk2Path;
-  m.rom = g_settings.romPathII;
+  m.rom = g_romPath;
   for (int i = 0; i < RAM2_COUNT; i++) if (kRamSizes[i] == s_ramSize) m.ram = i;
   m.screen = s_screenLive;
   const char *e = macsnap_save(s_snapSave, s_snapReplace, m, screenPixel, kScreenW, kScreenH, saveState);
@@ -1263,8 +1816,8 @@ bool startFromSnapshot(const std::string &snap) {
   if (!macsnap_machine(snap, m)) { snprintf(s_error, sizeof s_error, "Cannot read the snapshot"); return false; }
   g_settings.disk = m.disk;
   g_settings.disk2 = m.disk2;
-  g_settings.romPathII = m.rom;
-  g_settings.ramII = m.ram;
+  g_romPath = m.rom;
+  g_ramIndex = m.ram;
   g_settings.screen = m.screen;
   settingsSave();
   s_diskPath = m.disk;
@@ -1278,7 +1831,7 @@ bool startFromSnapshot(const std::string &snap) {
     hal_panel_fill(0, 0, PANEL_W, PANEL_H, 0);
     return broken ? powerOn() : true;               // not "broken": nothing was loaded
   }
-  setSpeed(1);                                      // always real time (no speed setting)
+  applySpeedSetting();                              // the setting, not the snapshot's
   // The clock moves on to now when there is one: the RTC and the System's copy (Time, 0x20C).
   uint32_t secs;
   if (hostClock(&secs)) {
@@ -1304,7 +1857,11 @@ void dbgCommand(const char *line) {
 unsigned peekWord(uint32_t a) {
   const uint32_t p = phys(a & ~1u);
   if ((p >> 28) == 4 || ((p >> 28) < 4 && s_overlay)) return rd<2>(s_rom + (p & (kRomSize - 1)));
+#if defined(MACII_IICI)
+  if ((p >> 28) < 4) { uint8_t *h = ramHost(p); return h ? rd<2>(h) : 0; }
+#else
   if ((p >> 28) < 4 && p + 2 <= s_ramSize) return rd<2>(s_ram + p);
+#endif
   return 0;
 }
 
@@ -1370,7 +1927,8 @@ void dbgStep() {
 // --- EmuCore ------------------------------------------------------------------------------------
 uint32_t s_frames = 0, s_secFrac = 0;
 int16_t s_sound[kSamples];
-uint32_t s_speedT0 = 0, s_speedF0 = 0;
+uint32_t s_speedT0 = 0, s_speedF0 = 0, s_speedW0 = 0;
+uint64_t s_speedC0 = 0;
 char s_speedText[64];
 uint32_t s_underrunsShown = 0;
 uint32_t s_lastFrameMs = 0;
@@ -1386,7 +1944,7 @@ void jumpTableToRam() {
   std::unordered_map<Handler, uint16_t> seen;
   std::vector<Handler> list;
   for (int i = 0; i < 0x10000; i++) {
-    const Handler h = m68k020i_static_instruction_jump_table[i];
+    const Handler h = m68kXi_static_instruction_jump_table[i];
     auto it = seen.find(h);
     if (it == seen.end()) { it = seen.emplace(h, (uint16_t)list.size()).first; list.push_back(h); }
     idx[i] = it->second;
@@ -1411,7 +1969,7 @@ bool macii_init() {
   jumpTableToRam();
   s_rom = (uint8_t *)hal_alloc_big(kRomSize);
   s_vram = (uint8_t *)hal_alloc_big(kVramSize);
-  slotrom::build(s_slotRom);
+  slotrom::build(s_slotRom, kCardSlot);
   hal_serial_cmd = dbgCommand;
   s_error[0] = 0;
   return s_rom && s_vram && macii_op_index;
@@ -1427,12 +1985,16 @@ bool macii_loadRom(const char *path) {
   s_disk2Path = g_settings.disk2;
   s_screenLive = g_settings.screen == SCREEN_PAN ? SCREEN_PAN : SCREEN_FIT;
   s_via1.irq = viaIrq;
+#if !defined(MACII_IICI)
   s_via2.irq = viaIrq;
+#endif
   s_via1.inA = via1InA;
   s_via1.inB = via1InB;
   s_via1.outB = via1OutB;
+#if !defined(MACII_IICI)
   s_via2.inA = via2InA;
   s_via2.outB = via2OutB;
+#endif
   loadPram();
   memset(s_down, 0, sizeof s_down);
   memset(s_downShift, 0, sizeof s_downShift);
@@ -1445,6 +2007,8 @@ bool macii_loadRom(const char *path) {
   s_frames = s_secFrac = 0;
   s_speedT0 = hal_micros();
   s_speedF0 = 0;
+  s_speedC0 = s_runCycles;
+  s_speedW0 = hal_audio_wait_us();
   s_noteUntil = 0;
   s_stripUsed = g_settings.showFps;
   s_redraw = true;
@@ -1494,6 +2058,10 @@ void macii_runFrame(bool draw) {
   s_lastFrameMs = ms;
 
   moveMouse();
+#if defined(EMU_WEB)
+  hal_web_ui_pc();
+  webPointer();
+#endif
   dbgStep();
   if (s_adbAt == UINT64_MAX && s_adb.autoPoll()) s_adbAt = viaNow() + AdbBus::kByteTicks;   // ADB idle: auto-poll
   // Where a frame's time goes, logged every 600 frames: the 68020, the rest, waiting for the sound.
@@ -1502,8 +2070,14 @@ void macii_runFrame(bool draw) {
   if (pT && tA - pT < 1000000) pRest += tA - pT;
   // The frame in 10 parts, the ASC playing 37 samples after each: its FIFO drains as it would.
   for (int part = 0; part < 10; part++) {
-    run((kFrameCycles * (part + 1) / 10 - kFrameCycles * part / 10) * (uint32_t)s_speed);
+    const uint32_t cyc = (uint32_t)((uint64_t)(kFrameCycles * (part + 1) / 10 - kFrameCycles * part / 10) * s_speed / 4);
+    s_runCycles += cyc;
+    run(cyc);
+#if defined(MACII_IICI)
+    if (s_asc.render(s_sound + part * (kSamples / 10), kSamples / 10)) s_rbv.asc();
+#else
     if (s_asc.render(s_sound + part * (kSamples / 10), kSamples / 10)) s_via2.pulse(Via6522::CB1);
+#endif
   }
   // A disk's first write since the start or the last snapshot: the snapshots before no longer fit it.
   for (int i = 0; i < sony::kDrives; i++)
@@ -1541,11 +2115,13 @@ void macii_runFrame(bool draw) {
     const int n = s_stretch.run(s_sound, kSamples, hal_audio_queued_us());
     hal_audio_write(s_stretch.out, n);              // its blocking paces the Mac
   }
+  const uint32_t tPrev = pT;
   pT = hal_micros();
+  if (tPrev) maxSpeedStep(tB - tPrev, hal_audio_queued_us());
   pCpu += tB - tA;
   pAudio += pT - tB;
   if (s_frames % 600 == 0) {
-    hal_log("macii: per frame (us): cpu+devices %u, sound wait %u, rest %u; %u slices; sound x%.3f", (unsigned)(pCpu / 600), (unsigned)(pAudio / 600), (unsigned)(pRest / 600), (unsigned)(s_slices / 600), (double)s_stretch.stretch);
+    hal_log("macii: per frame (us): cpu+devices %u, sound wait %u, rest %u; %u slices; sound x%.3f; cpu %d.%02dx", (unsigned)(pCpu / 600), (unsigned)(pAudio / 600), (unsigned)(pRest / 600), (unsigned)(s_slices / 600), (double)s_stretch.stretch, s_speed / 4, s_speed % 4 * 25);
     pCpu = pAudio = pRest = 0;
     s_slices = 0;
   }
@@ -1580,33 +2156,40 @@ void macii_shutdown() {
 const char *macii_fpsText() {
   const uint32_t now = hal_micros(), us = now - s_speedT0;
   if (us) {
-    const uint64_t cyc = (uint64_t)(s_frames - s_speedF0) * kFrameCycles * (uint64_t)s_speed;
+    const uint64_t cyc = s_runCycles - s_speedC0;
     // gaps: sound output buffers that ran dry since the last reading (each one is a click)
     const uint32_t under = hal_audio_underruns();
-    snprintf(s_speedText, sizeof s_speedText, "%u%% of a Mac II  %u gaps",
-             (unsigned)(cyc * 100 * 1000000 / kCpuHz / us), (unsigned)(under - s_underrunsShown));
+    // max: the speed with no waiting for the sound, from the time the frames took minus that wait
+    // (the headroom: 4.0x = this machine could run four Mac IIs, a 68020 at 63 MHz)
+    const uint32_t wait = hal_audio_wait_us() - s_speedW0, busy = us > wait ? us - wait : 1;
+    const uint64_t maxX10 = cyc * 10 * 1000000 / kCpuHz / busy;
+    snprintf(s_speedText, sizeof s_speedText, "%u%% of a %s  max %u.%ux (%u MHz)  %u gaps",
+             (unsigned)(cyc * 100 * 1000000 / kCpuHz / us), kMachineName, (unsigned)(maxX10 / 10), (unsigned)(maxX10 % 10),
+             (unsigned)(cyc * 1000000 / busy / 1000000), (unsigned)(under - s_underrunsShown));
     s_underrunsShown = under;
   }
   s_speedT0 = now;
   s_speedF0 = s_frames;
+  s_speedC0 = s_runCycles;
+  s_speedW0 = hal_audio_wait_us();
   return s_speedText;
 }
 
 // --- in-game menu rows (as the Plus core) ---------------------------------------------------------
-enum { ROW_SNAP_LOAD, ROW_SNAP_SAVE, ROW_SCREEN, ROW_COLORS, ROW_ARROWS, ROW_DISK, ROW_DISK2, ROW_COUNT };
+// The snapshots, then Drives (a submenu, as pico-386's Disks), then the settings.
+// CPU speed: not on the P4 (kHasSpeed).
+#if defined(ESP_PLATFORM)
+enum { ROW_SNAP_LOAD, ROW_SNAP_SAVE, ROW_DRIVES, ROW_SCREEN, ROW_COLORS, ROW_ARROWS, ROW_COUNT, ROW_SPEED = -1 };
+#else
+enum { ROW_SNAP_LOAD, ROW_SNAP_SAVE, ROW_DRIVES, ROW_SCREEN, ROW_SPEED, ROW_COLORS, ROW_ARROWS, ROW_COUNT };
+#endif
+char s_speedName[16];
 const char *const kScreenNames[2] = { "Fit 320x240", "1:1 pan" };
 const char *const kColorNames[4] = { "Black & white", "4", "16", "256" };
 
 int colorsMode() {
   const int m = s_rtc.xpram[kColorsByte] - slotrom::kModeFirst;
   return m >= 0 && m <= 3 ? m : 0;
-}
-std::string s_diskName, s_disk2Name;
-
-std::string baseName(const std::string &path) {
-  if (path.empty()) return "None";
-  const size_t sl = path.find_last_of('/');
-  return path.substr(sl == std::string::npos ? 0 : sl + 1);
 }
 
 // A new boot or second disk: the Mac restarts with it (as a power cycle).
@@ -1642,20 +2225,58 @@ int setDisk2(const std::string &path, const char **why) {
 
 int macii_menuItems(CoreMenuItem *out, int max) {
   if (max < ROW_COUNT) return 0;
-  s_diskName = baseName(s_diskPath);
-  s_disk2Name = baseName(s_disk2Path);
   out[ROW_SNAP_LOAD] = { "Load snapshot", nullptr, false, ui::ICON_LOAD };
   out[ROW_SNAP_SAVE] = { "Save snapshot", nullptr, false, ui::ICON_SAVE };
+  out[ROW_DRIVES] = { "Drives", nullptr, false, ui::ICON_FOLDER };
   out[ROW_SCREEN] = { "Screen (Ctrl+Caps)", kScreenNames[s_screenLive == SCREEN_PAN], true, ui::ICON_PAD };
+  if (kHasSpeed) {
+    if (settingSpeed() == kSpeedMax) snprintf(s_speedName, sizeof s_speedName, "Max (%d.%dx)", s_speed / 4, s_speed % 4 * 25 / 10);
+    else snprintf(s_speedName, sizeof s_speedName, "%dx", settingSpeed());
+    out[ROW_SPEED] = { "CPU speed", s_speedName, true, ui::ICON_SKIP };
+  }
   out[ROW_COLORS] = { "Colors (restarts)", kColorNames[colorsMode()], true, ui::ICON_GEAR };
   out[ROW_ARROWS] = { "Arrows (both Shifts)", kArrowNames[g_settings.arrows], true, ui::ICON_PAD };
-  out[ROW_DISK] = { "Boot disk", s_diskName.c_str(), false, ui::ICON_FOLDER };
-  // Enter picks the second disk, </> eject it
-  out[ROW_DISK2] = { "Second disk", s_disk2Name.c_str(), !s_disk2Path.empty(), ui::ICON_FOLDER };
   return ROW_COUNT;
 }
 
+// Drives: the hard disk the Mac starts from (a change restarts it) and drive 2, the floppy, which
+// takes any image at once while it is empty (a disk the Mac has mounted is ejected there first).
+bool drivesMenu() {
+  macdrives::Drive drives[2] = {
+    { "Hard disk", s_diskPath, "The Mac starts from it: a change restarts it", ui::ICON_SAVE },
+    { "Floppy", s_disk2Path, "Any disk image; goes in at once", ui::ICON_LOAD },
+  };
+  return macdrives::menu(kMacII, drives, 2, [](int i, const std::string &path) {
+    if (i == 0) {
+      if (!path.empty()) {
+        if (path == s_disk2Path) { ui::message("Hard disk", "That disk is in the floppy drive", 2000); return false; }
+        sony::Image test;                           // not a disk image: say so, keep the Mac running
+        char err[96];
+        if (!test.open(path.c_str(), err, sizeof err)) { ui::message("Hard disk", err, 2500); return false; }
+        test.close();
+      }
+      g_settings.disk = path;
+      settingsSave();
+      s_diskPath = path;
+      restartWithDisks("Hard disk");
+      return true;
+    }
+    const char *why = nullptr;
+    const int r = setDisk2(path, &why);
+    if (r < 0) { ui::message("Floppy", why, 2500); return false; }
+    if (r == 0) restartWithDisks("Floppy");         // the Mac is still starting: no drive 2 yet
+    else ui::message("Floppy", path.empty() ? "Ejected" : macdrives::fileName(path).c_str(), 700);
+    return true;
+  });
+}
+
 bool macii_menuAction(int index, uint8_t key) {
+  if (index == ROW_DRIVES) return key == KEY_ENTER && drivesMenu();
+  if (index == ROW_SPEED) {                         // at once: the VIAs keep real time
+    g_settings.speed = (settingSpeed() - 1 + (key == KEY_LEFT ? -1 : 1) + kSpeedMax) % kSpeedMax + 1;
+    applySpeedSetting();
+    return false;
+  }
   const int d = key == KEY_LEFT ? -1 : 1;
   switch (index) {
     case ROW_SNAP_SAVE: {
@@ -1679,7 +2300,7 @@ bool macii_menuAction(int index, uint8_t key) {
       s_redraw = true;
       return false;
     case ROW_COLORS:
-      s_rtc.xpram[0x46] = 0x01; s_rtc.xpram[0x47] = 0x23;
+      s_rtc.xpram[kSlotPram] = 0x01; s_rtc.xpram[kSlotPram + 1] = 0x23;
       s_rtc.xpram[kColorsByte] = (uint8_t)(slotrom::kModeFirst + (colorsMode() + d + 4) % 4);
       s_rtc.dirty = true;
       s_colorsChanged = true;
@@ -1688,42 +2309,15 @@ bool macii_menuAction(int index, uint8_t key) {
       g_settings.arrows = (g_settings.arrows + d + ARROWS_COUNT) % ARROWS_COUNT;
       s_arrows = 0;
       return false;
-    case ROW_DISK: {
-      if (key != KEY_ENTER) return false;
-      std::string path;
-      if (!browseRom(kMacII, path)) return false;
-      {
-        sony::Image test;                           // not a disk image: say so, keep the Mac running
-        char err[96];
-        if (!test.open(path.c_str(), err, sizeof err)) { ui::message("Boot disk", err, 2500); return false; }
-        test.close();
-      }
-      g_settings.disk = path;
-      settingsSave();
-      s_diskPath = path;
-      restartWithDisks("Boot disk");
-      return true;
-    }
-    case ROW_DISK2: {
-      // Into an empty drive 2 at once; a disk the Mac has mounted must be ejected there first.
-      // A Mac whose driver has no drive 2 yet (still starting) restarts with it.
-      std::string path;
-      if (key == KEY_ENTER) {
-        if (!browseRom(kMacII, path)) return false;
-      } else if (s_disk2Path.empty()) {
-        return false;
-      }
-      const char *why = nullptr;
-      const int r = setDisk2(path, &why);
-      if (r < 0) { ui::message("Second disk", why, 2500); return false; }
-      if (r == 0) { restartWithDisks("Second disk"); return true; }
-      return true;
-    }
   }
   return false;
 }
 
-const char *macii_lastError() { return s_error[0] ? s_error : "Cannot start the Mac II"; }
+const char *macii_lastError() {
+  static char text[40];
+  snprintf(text, sizeof text, "Cannot start the %s", kMachineName);
+  return s_error[0] ? s_error : text;
+}
 
 } // namespace
 
@@ -1741,14 +2335,100 @@ void macii_write8(unsigned int a, unsigned int v) { busWrite<1>(a, v); }
 void macii_write16(unsigned int a, unsigned int v) { busWrite<2>(a, v); }
 void macii_write32(unsigned int a, unsigned int v) { busWrite<4>(a, v); }
 int macii_irq_ack(int) { return M68K_INT_ACK_AUTOVECTOR; }
+
+#if defined(MACII_IICI)
+// The PMMU's registers (maciici_mmu.h). TC: E (bit 31), SRE (25), FCL (24, ignored), PS (20-23), IS
+// (16-19), TIA-TID; a TC whose fields do not add up to 32 is a configuration exception.
+int maciici_mmu_set(int reg, unsigned long long v) {
+  switch (reg) {
+    case MACIICI_MMU_TC: {
+      const uint32_t tc = (uint32_t)v;
+      if (tc & 0x80000000u) {
+        int sum = (tc >> 20 & 15) + (tc >> 16 & 15);
+        for (int sh = 12; sh >= 0 && (tc >> sh & 15); sh -= 4) sum += tc >> sh & 15;
+        if (sum != 32 || (tc >> 20 & 15) < 8) {
+          hal_log("maciici: bad TC %08x at pc %08x", (unsigned)tc, (unsigned)m68k_get_reg(nullptr, M68K_REG_PPC));
+          return 1;
+        }
+      }
+      s_mmu.tc = tc;
+      s_mmuOn = (tc & 0x80000000u) != 0;
+      break;
+    }
+    case MACIICI_MMU_SRP: case MACIICI_MMU_CRP:
+      if (((v >> 32) & 3) == 0) return 1;
+      (reg == MACIICI_MMU_SRP ? s_mmu.srp : s_mmu.crp) = v;
+      // No flush: the ATC keeps what PLOAD put there. _SwapMMUMode depends on it: it PLOADs the
+      // address of the new TC, loads the CRP, and then reads the TC through the old mapping.
+      return 0;
+    case MACIICI_MMU_TT0: s_mmu.tt0 = (uint32_t)v & 0xFFFF8777u; break;
+    case MACIICI_MMU_TT1: s_mmu.tt1 = (uint32_t)v & 0xFFFF8777u; break;
+    case MACIICI_MMU_SR: s_mmu.sr = (uint16_t)v; return 0;
+  }
+  tlbFlush();
+  return 0;
+}
+unsigned long long maciici_mmu_get(int reg) {
+  switch (reg) {
+    case MACIICI_MMU_TC: return s_mmu.tc;
+    case MACIICI_MMU_SRP: return s_mmu.srp;
+    case MACIICI_MMU_CRP: return s_mmu.crp;
+    case MACIICI_MMU_TT0: return s_mmu.tt0;
+    case MACIICI_MMU_TT1: return s_mmu.tt1;
+    case MACIICI_MMU_SR: return s_mmu.sr;
+  }
+  return 0;
+}
+void maciici_mmu_flush(void) { tlbFlush(); }
+unsigned int maciici_mmu_ptest(unsigned int addr, int fc, int write, int level, unsigned int *pa) {
+  uint32_t p = addr;
+  uint16_t sr = 0;
+  if (s_mmuOn || level) mmuWalk(addr, fc, write != 0, false, level, &p, &sr);
+  *pa = p;
+  return sr;
+}
+void maciici_mmu_pload(unsigned int addr, int fc, int write) {
+  if (!s_mmuOn) return;
+  uint32_t p;
+  uint16_t sr;
+  // Into the translation cache, as the ATC.
+  if (!mmuWalk(addr, fc, write != 0, true, 0, &p, &sr)) return;
+  if (((s_mmu.tc >> 20) & 15) < 12 && !(sr & 0x40)) return;   // pages under 4 KB: not cached
+  tlbFill(addr, p, false);   // reads only: a write must still go through the walk (the M bit)
+}
+#endif
 void macii_pulse_reset(void) {}
 // MACII_PC_HISTORY (a debugging build, -DMACII_PC_HISTORY): the last 64 jumps (PCs), printed
 // with an illegal instruction.
 #if defined(MACII_PC_HISTORY)
 static unsigned s_pcHist[64], s_pcHistAt = 0;
+static unsigned s_pcLong[4096], s_pcLongAt = 0;
 void macii_instr_hook(unsigned int pc) {   // jumps only: a PC not just after the last one
   static unsigned last = 0;
-  if (pc - last > 10) s_pcHist[s_pcHistAt++ & 63] = pc;
+  if (pc - last > 10) {
+    s_pcHist[s_pcHistAt++ & 63] = pc;
+    s_pcLong[s_pcLongAt++ & 4095] = pc;
+    // MACII_TRAP=<hex pc>: the jumps before the first time the PC gets there
+    static const unsigned trap = getenv("MACII_TRAP") ? (unsigned)strtoul(getenv("MACII_TRAP"), nullptr, 16) : 0;
+    static bool done = false;
+    if (trap && pc == trap && !done) {
+      done = true;
+      char line[64 * 9 + 1], *o = line;
+      for (unsigned i = 0; i < 64; i++) o += sprintf(o, " %08x", s_pcHist[(s_pcHistAt + i) & 63]);
+      hal_log("macii: the PCs before %08x:%s", trap, line);
+      std::string l;
+      unsigned prev = 0;
+      for (unsigned i = 0; i < 4096; i++) {
+        const unsigned v = s_pcLong[(s_pcLongAt + i) & 4095];
+        if (v == prev) continue;
+        prev = v;
+        char t[12]; snprintf(t, sizeof t, " %08x", v); l += t;
+        if (l.size() > 180) { hal_log("macii: long%s", l.c_str()); l.clear(); }
+      }
+      hal_log("macii: long%s", l.c_str());
+      dbgDump();
+    }
+  }
   last = pc;
 }
 #endif
@@ -1760,7 +2440,7 @@ void opCountDump() {
   FILE *f = fopen(getenv("MACII_OPCOUNT_OUT") ? getenv("MACII_OPCOUNT_OUT") : "opcount.txt", "w");
   if (!f) return;
   fprintf(f, "base %p\n", (void *)&macii_illegal);
-  for (int i = 0; i < 65536; i++) if (s_opCount[i]) fprintf(f, "%04x %p %u\n", i, (void *)m68k020i_static_instruction_jump_table[i], (unsigned)s_opCount[i]);
+  for (int i = 0; i < 65536; i++) if (s_opCount[i]) fprintf(f, "%04x %p %u\n", i, (void *)m68kXi_static_instruction_jump_table[i], (unsigned)s_opCount[i]);
   fclose(f);
 }
 #endif
@@ -1819,13 +2499,19 @@ void maciicore_mouse(int x, int y, int button) {
 
 // The desktop's MAC_KEYS "disk2": MAC_DISK2_LATER into drive 2 while it runs (as the menu does).
 void maciicore_disk2(const char *path) {
+  if (!s_running) return;
   const char *why = "";
   const int r = setDisk2(path ? path : "", &why);
   hal_log("macii: second disk %s: %s", path ? path : "(none)", r > 0 ? "inserted" : r == 0 ? "needs a restart" : why);
 }
 
 const EmuCore kMacII = {
-  "Macintosh II", "mac", ".dsk.img.image.hfv.hfs.dc42.diskcopy",
+#if defined(MACII_IICI)
+  "Macintosh IIci", "mac",
+#else
+  "Macintosh II", "mac",
+#endif
+  ".dsk.img.image.hfv.hfs.dc42.diskcopy",
   macii_init, macii_loadRom, macii_reset, macii_runFrame, macii_setInput, macii_frameRate,
   nullptr, nullptr, macii_shutdown,
   macii_keyEvent, macii_menuItems, macii_menuAction, macii_lastError, true, macii_fpsText,

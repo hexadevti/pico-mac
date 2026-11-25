@@ -64,7 +64,7 @@ const uint16_t kCode[] = {
   0x4E75,                   // 36 rts
   // 37 Int (the slot interrupt):
   kEmulVblAck,              // 37
-  0x7009,                   // 38 moveq   #9,d0             the slot
+  0x7009,                   // 38 moveq   #9,d0             the slot (build() puts the card's)
   0x2078, 0x0D28,           // 39 movea.l jVBLTask,a0
   0x4E90,                   // 41 jsr     (a0)
   0x7001,                   // 42 moveq   #1,d0             handled
@@ -94,8 +94,10 @@ class Builder {
   }
 };
 
-// Builds the ROM; `out` receives kSize bytes, the last at slot offset 0xFFFFFF.
-inline void build(uint8_t *out) {
+// Builds the ROM for a card in `slot` (9 on the Mac II, 0xE on the IIci: the interrupt routine
+// passes it to jVBLTask, whose cursor task runs only for the main screen's slot); `out` receives
+// kSize bytes, the last at slot offset 0xFFFFFF.
+inline void build(uint8_t *out, unsigned slot) {
   static Builder r;
   r.n = 0;
   memset(r.b, 0, sizeof r.b);
@@ -147,7 +149,8 @@ inline void build(uint8_t *out) {
   for (size_t i = 0; i < sizeof name - 1; i++) r.u8((uint8_t)name[i]);
   r.align();
   const int code = r.n;
-  for (uint16_t w : kCode) r.u16(w);
+  for (size_t i = 0; i < sizeof kCode / sizeof kCode[0]; i++)
+    r.u16(i == kInt + 1 ? (uint16_t)(0x7000 | slot) : kCode[i]);
   auto off = [&](int word) { return (uint16_t)(code + 2 * word - drvr); };
   auto put16 = [&](int at, uint16_t v) { r.b[at] = (uint8_t)(v >> 8); r.b[at + 1] = (uint8_t)v; };
   put16(drvr + 8, off(kOpen));

@@ -29,24 +29,34 @@
 #include "mac_snapshot.h"
 #include "../frontend/ui.h"
 #include "../frontend/settings.h"
+#include "../frontend/startups.h"
 #include "../hal/hal.h"
 
 namespace {
 
 constexpr char kMagic[8] = { 'P', 'M', 'A', 'C', 'S', 'N', 'P', '1' };
 constexpr char kMagicII[8] = { 'P', 'M', 'I', 'I', 'S', 'N', 'P', '1' };
-bool isII() { return g_settings.machine == MACHINE_II; }
-const char *magic() { return isII() ? kMagicII : kMagic; }
+constexpr char kMagicIIci[8] = { 'P', 'M', 'I', 'C', 'S', 'N', 'P', '1' };
+bool isII() { return g_settings.machine == MACHINE_II || g_settings.machine == MACHINE_IICI; }
+bool isIIci() { return g_settings.machine == MACHINE_IICI; }
+const char *magic() { return isIIci() ? kMagicIIci : isII() ? kMagicII : kMagic; }
 constexpr int kThumbW = 80, kThumbH = 54;
 std::string s_pending;                 // the snapshot mac_loadRom starts from next
 
 #if defined(BOARD_PICOCALC_P4)
 constexpr char kHardware[] = "p4";
+#elif defined(EMU_WEB)
+constexpr char kHardware[] = "web";
 #else
 constexpr char kHardware[] = "desktop";
 #endif
 
-std::string snapDir() { return sdPath((std::string("picomac/snapshots/") + kHardware + (isII() ? "-macii" : "")).c_str()); }
+// A startup's own folder (startups.h), else the machine's; each Mac's snapshots apart.
+std::string snapDir() {
+  const char *own = startup_snapdir();
+  const std::string base = *own ? std::string("picomac/") + own : std::string("picomac/snapshots/") + kHardware;
+  return sdPath((base + (isIIci() ? "-maciici" : isII() ? "-macii" : "")).c_str());
+}
 std::string genFile() { return sdPath("picomac/snapshots/disks.gen"); }
 
 // Paths are kept relative to the card's root, so a card moved between machines still matches.

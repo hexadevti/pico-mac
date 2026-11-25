@@ -74,6 +74,9 @@ const uint16_t *maccore_fullshot(int *w, int *h);
 const uint16_t *maciicore_fullshot(int *w, int *h);
 void maciicore_mouse(int x, int y, int button);   // the Mac II: the pointer and the button
 void maciicore_disk2(const char *path);            // the Mac II: a disk into drive 2 while it runs
+const uint16_t *maciicicore_fullshot(int *w, int *h);   // the same three for the Mac IIci
+void maciicicore_mouse(int x, int y, int button);
+void maciicicore_disk2(const char *path);
 
 static void saveShot(const char *name) {
   SDL_Surface *sf = SDL_CreateRGBSurfaceWithFormatFrom(s_panel, PANEL_W, PANEL_H, 16, PANEL_W * 2, SDL_PIXELFORMAT_RGB565);
@@ -198,16 +201,17 @@ static void scriptStep() {
   if (!ks.step(hal_millis(), s_qHead == s_qTail, qPush, t, sizeof(t))) return;
   if (!strcmp(t, "quit")) exit(0);
   int mx, my;
-  if (sscanf(t, "at%dx%d", &mx, &my) == 2) maciicore_mouse(mx, my, -1);
-  if (!strcmp(t, "mdown")) maciicore_mouse(-1, -1, 1);
-  if (!strcmp(t, "mup")) maciicore_mouse(-1, -1, 0);
-  if (!strcmp(t, "disk2")) maciicore_disk2(getenv("MAC_DISK2_LATER"));   // test hook
+  if (sscanf(t, "at%dx%d", &mx, &my) == 2) { maciicore_mouse(mx, my, -1); maciicicore_mouse(mx, my, -1); }
+  if (!strcmp(t, "mdown")) { maciicore_mouse(-1, -1, 1); maciicicore_mouse(-1, -1, 1); }
+  if (!strcmp(t, "mup")) { maciicore_mouse(-1, -1, 0); maciicicore_mouse(-1, -1, 0); }
+  if (!strcmp(t, "disk2")) { maciicore_disk2(getenv("MAC_DISK2_LATER")); maciicicore_disk2(getenv("MAC_DISK2_LATER")); }   // test hook
   if (!strcmp(t, "dump") && hal_serial_cmd) hal_serial_cmd("@mac");
   if (!strcmp(t, "shot")) { char n[32]; snprintf(n, sizeof(n), "shot%d.bmp", ++shots); saveShot(n); }
   // bigshot: the Mac's whole screen, which the panel may scale or pan
   int bw = 0, bh = 0;
   const uint16_t *big = !strcmp(t, "bigshot") ? maccore_fullshot(&bw, &bh) : nullptr;
   if (!big && !strcmp(t, "bigshot")) big = maciicore_fullshot(&bw, &bh);
+  if (!big && !strcmp(t, "bigshot")) big = maciicicore_fullshot(&bw, &bh);
   if (big) {
     char n[32];
     snprintf(n, sizeof(n), "shot%d.bmp", ++shots);

@@ -1175,6 +1175,23 @@ static inline int is_inf(floatx80 reg) {
 	return 0;
 }
 
+// pico-mac: the 68881 normalizes an unnormalized extended operand (exponent set, integer bit clear)
+// before it works on it; softfloat assumes it is normal. floatx80_div's correction loop then runs
+// ~2^63/significand times: SimCity 2000's power grid froze the Mac II for minutes.
+static floatx80 fx80_normalize(floatx80 a)
+{
+	int exp = a.high & 0x7fff;
+	uint64 sig = a.low;
+	if (exp == 0 || exp == 0x7fff || (sig >> 63)) return a;
+	if (!sig) { a.high &= 0x8000; return a; }		// an unnormal zero
+	int sh = __builtin_clzll(sig);
+	if (sh >= exp) { sh = exp - 1; exp = 0; }		// too small: a denormal
+	else exp -= sh;
+	a.low = sig << sh;
+	a.high = (a.high & 0x8000) | exp;
+	return a;
+}
+
 static void fpgen_rm_reg(uint16 w2)
 {
 	int ea = REG_IR & 0x3f;
@@ -1362,6 +1379,9 @@ static void fpgen_rm_reg(uint16 w2)
 	{
 		source = REG_FP[src];
 	}
+
+	source = fx80_normalize(source);
+	REG_FP[dst] = fx80_normalize(REG_FP[dst]);
 
 	if ((opmode & 0x44) == 0x44)
 	{

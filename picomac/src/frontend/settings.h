@@ -9,8 +9,13 @@
 enum { SCREEN_FIT, SCREEN_PAN, SCREEN_NATIVE, SCREEN_COUNT };
 // RAM sizes in KB
 enum { RAM_512K, RAM_1M, RAM_2M, RAM_4M, RAM_COUNT };
-// The machine the home menu starts, and the Mac II's RAM sizes
-enum { MACHINE_PLUS, MACHINE_II, MACHINE_COUNT };
+// The machine the home menu starts (the IIci: not on the P4), and the Mac II's RAM sizes (the
+// IIci's four are 4, 8, 16 and 32 MB).
+#if defined(ESP_PLATFORM)
+enum { MACHINE_PLUS, MACHINE_II, MACHINE_COUNT, MACHINE_IICI = -1 };
+#else
+enum { MACHINE_PLUS, MACHINE_II, MACHINE_IICI, MACHINE_COUNT };
+#endif
 enum { RAM2_1M, RAM2_2M, RAM2_4M, RAM2_8M, RAM2_COUNT };
 
 struct Settings {
@@ -27,6 +32,9 @@ struct Settings {
   int machine = MACHINE_PLUS;
   std::string romPathII = "picomac/macii.rom";   // the Mac II's ROM, relative to the card root
   int ramII = RAM2_4M;
+  std::string romPathIIci = "picomac/maciici.rom";   // the Mac IIci's ROM
+  int ramIIci = 1;           // 8 MB
+  std::string startup;       // the startup last chosen (its file in /picomac/startups)
 };
 
 extern Settings g_settings;
