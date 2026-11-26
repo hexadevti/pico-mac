@@ -249,6 +249,10 @@ constexpr bool kHasSpeed = true;
 #endif
 constexpr int kSpeedMax = 5;             // the setting's "Max"
 constexpr int kMaxQuarters = 64;         // Max stops at 16x
+// The ROM's start-up tests fail above 4x (the Quadra's: a sad Mac at 8x, its loops time the VIAs):
+// Max stays at 4x until the first call to our .Sony (the tests are over), again after each RESET.
+constexpr int kStartupQuarters = 16;
+bool s_pastStartup = false;
 int settingSpeed() {
   if (!kHasSpeed) return 1;
   return g_settings.speed < 1 ? 1 : g_settings.speed > kSpeedMax ? kSpeedMax : g_settings.speed;
@@ -277,6 +281,7 @@ void maxSpeedStep(uint32_t busyUs, uint32_t queuedUs) {
   int q = s_speed;
   if (queuedUs < 20000 || avg > kBusyUs * 1.05f) q -= q / 16 > 1 ? q / 16 : 1;
   else if (avg < kBusyUs * 0.85f && ++n % 4 == 0) q++;
+  if (!s_pastStartup && q > kStartupQuarters) q = kStartupQuarters;
   if (q != s_speed) setSpeed(q);
 }
 
@@ -1474,6 +1479,7 @@ uint32_t romChecksum() { return (uint32_t)s_rom[0] << 24 | s_rom[1] << 16 | s_ro
 
 void machineReset() {
   memset(s_ram, 0, s_ramSize);
+  s_pastStartup = false;
   s_overlay = true;
   s_addr32 = false;
   fastUpdate();
@@ -2046,6 +2052,7 @@ int loadState(FILE *f) {
     s_cycles = g.cycles; s_viaBase = g.viaBase; s_cycBase = g.cycBase; s_adbAt = g.adbAt;
     s_speed = g.speed & 0x10000 ? g.speed & 0xFFFF : g.speed * 4; s_irqLevel = g.irqLevel;
     if (s_speed < 4) s_speed = 4;
+    s_pastStartup = true;                             // a snapshot is past the start-up tests
     s_depth = g.depth & 3; s_rowBytes = g.rowBytes; s_base = g.base & (kVramSize - 1);
     memcpy(s_clut, g.clut, sizeof s_clut);
     s_clutIndex = g.clutIndex; s_vblEnable = g.vblEnable; s_vblPending = g.vblPending; s_mode = g.mode;
@@ -2778,7 +2785,7 @@ void maciici_mmu_pload(unsigned int addr, int fc, int write) {
   tlbFill(addr, p, false);   // reads only: a write must still go through the walk (the M bit)
 }
 #endif
-void macii_pulse_reset(void) {}
+void macii_pulse_reset(void) { s_pastStartup = false; }   // the ROM restarts: its tests again
 // MACII_PC_HISTORY (a debugging build, -DMACII_PC_HISTORY): the last 64 jumps (PCs), printed
 // with an illegal instruction.
 #if defined(MACII_PC_HISTORY)
@@ -2828,6 +2835,7 @@ void opCountDump() {
 
 int macii_illegal(int opcode) {
   if ((opcode & 0xFFF0) == 0x7120) {                // the .Sony driver (macii_sony.h)
+    s_pastStartup = true;
     const int32_t d0 = s_sony.op((uint16_t)opcode, m68k_get_reg(nullptr, M68K_REG_A0), m68k_get_reg(nullptr, M68K_REG_A1),
                                  m68k_get_reg(nullptr, M68K_REG_A2), m68k_get_reg(nullptr, M68K_REG_D1));
     m68k_set_reg(M68K_REG_D0, (uint32_t)d0);

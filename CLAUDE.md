@@ -44,7 +44,7 @@ first.
   Colours: XPRAM 0x46 is slot 9's PRAM (board ID 0x0123, then 0x48 = the start-up mode, spID 0x80-0x83 =
   1-8 bits). System755.dsk has no Monitors panel, so the menu's Colors row writes it and restarts;
   a fresh PRAM starts at 256. MAC_KEYS on the Mac II also takes atXxY, mdown, mup (the pointer).
-  CPU speed (not on the P4): s_speed is in quarters (4 = 1x); the setting 5 = Max, maxSpeedStep holds the frame's work near 11.5 ms (up to 16x). The VIAs stay real time.
+  CPU speed (not on the P4): s_speed is in quarters (4 = 1x); the setting 5 = Max, maxSpeedStep holds the frame's work near 11.5 ms (up to 16x). Max stays at 4x until the first .Sony call (and again after a RESET): above that the ROM's start-up tests fail (the Quadra: a sad Mac at 8x, 32 MB, on an iPhone). The VIAs stay real time.
   Below full speed the core stretches each frame's sound (SoundStretch, from the queued audio, up
   to 25%): without it the P4's DMA ran dry several times a second, a crackle on game sounds.
   The keys are ADB raw codes: the arrows are 0x3B-0x3E (the umac MKC_ ones, 0x7B-0x7E, are the
