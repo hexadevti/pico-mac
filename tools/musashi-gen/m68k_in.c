@@ -941,7 +941,7 @@ M68KMAKE_OP(1111, 0, ., .)
 
 M68KMAKE_OP(040fpu0, 32, ., .)
 {
-	if(CPU_TYPE_IS_030_PLUS(CPU_TYPE))
+	if(CPU_HAS_FPU(CPU_TYPE))
 	{
 		m68040_fpu_op0();
 		return;
@@ -952,7 +952,7 @@ M68KMAKE_OP(040fpu0, 32, ., .)
 
 M68KMAKE_OP(040fpu1, 32, ., .)
 {
-	if(CPU_TYPE_IS_030_PLUS(CPU_TYPE))
+	if(CPU_HAS_FPU(CPU_TYPE))
 	{
 		m68040_fpu_op1();
 		return;

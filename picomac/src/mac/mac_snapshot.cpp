@@ -1,9 +1,10 @@
 // mac_snapshot.cpp -- snapshots of a running Mac, to start from later where it stopped. Laid out
 // like pico-386's pc_snapshot.cpp.
 //
-// A snapshot is /picomac/snapshots/<hardware>/sN.snp: a header with its name, the machine it
-// needs (the disks, ROM, RAM size and screen mode) and the generation of each disk, then the Mac
-// itself (umac_save_state: the 68000, the VIA, SCC, RTC, keyboard, drives and all of the RAM).
+// A snapshot is /picomac/snapshots/<hardware>/sN.snp (a Mac II's: <hardware>-macii): a header
+// with its name, the machine it needs (the disks, ROM, RAM size and screen mode) and the
+// generation of each disk, then the Mac itself, as its core writes it (the Plus: umac_save_state,
+// the 68000, the VIA, SCC, RTC, keyboard, drives and all of the RAM; the Mac II: macii_core.cpp).
 // Restoring starts a Mac with that machine (the settings follow it) and loads the state into it.
 //
 // The Mac keeps parts of its disks in RAM (the volume's bitmap and catalog, the file buffers), so
@@ -12,7 +13,7 @@
 // a snapshot whose disks moved on asks first.
 //
 // Beside each sN.snp is sN.bmp, the Mac's screen when it was taken (80x54, RGB565 top-down). The
-// list shows it at the left of the name.
+// list shows it at the left of the name. g_settings.machine says which Mac's snapshots these are.
 //
 // <hardware> keeps each build's snapshots apart: the 68000's context is saved as this build lays
 // it out.
@@ -28,25 +29,34 @@
 #include "mac_snapshot.h"
 #include "../frontend/ui.h"
 #include "../frontend/settings.h"
+#include "../frontend/startups.h"
 #include "../hal/hal.h"
-
-extern "C" {
-#include "umac/umac.h"
-}
 
 namespace {
 
 constexpr char kMagic[8] = { 'P', 'M', 'A', 'C', 'S', 'N', 'P', '1' };
+constexpr char kMagicII[8] = { 'P', 'M', 'I', 'I', 'S', 'N', 'P', '1' };
+constexpr char kMagicIIci[8] = { 'P', 'M', 'I', 'C', 'S', 'N', 'P', '1' };
+bool isII() { return g_settings.machine == MACHINE_II || g_settings.machine == MACHINE_IICI; }
+bool isIIci() { return g_settings.machine == MACHINE_IICI; }
+const char *magic() { return isIIci() ? kMagicIIci : isII() ? kMagicII : kMagic; }
 constexpr int kThumbW = 80, kThumbH = 54;
 std::string s_pending;                 // the snapshot mac_loadRom starts from next
 
 #if defined(BOARD_PICOCALC_P4)
 constexpr char kHardware[] = "p4";
+#elif defined(EMU_WEB)
+constexpr char kHardware[] = "web";
 #else
 constexpr char kHardware[] = "desktop";
 #endif
 
-std::string snapDir() { return sdPath((std::string("picomac/snapshots/") + kHardware).c_str()); }
+// A startup's own folder (startups.h), else the machine's; each Mac's snapshots apart.
+std::string snapDir() {
+  const char *own = startup_snapdir();
+  const std::string base = *own ? std::string("picomac/") + own : std::string("picomac/snapshots/") + kHardware;
+  return sdPath((base + (isIIci() ? "-maciici" : isII() ? "-macii" : "")).c_str());
+}
 std::string genFile() { return sdPath("picomac/snapshots/disks.gen"); }
 
 // Paths are kept relative to the card's root, so a card moved between machines still matches.
@@ -109,8 +119,8 @@ struct Header {
 
 // Reads the header; f is left at the machine state.
 bool readHeader(FILE *f, Header &h, bool nameOnly) {
-  char magic[8];
-  if (!get(f, magic, 8) || memcmp(magic, kMagic, 8) || !getStr(f, h.name, 200)) return false;
+  char mg[8];
+  if (!get(f, mg, 8) || memcmp(mg, magic(), 8) || !getStr(f, h.name, 200)) return false;
   if (nameOnly) return true;
   return getStr(f, h.disk, 300) && getStr(f, h.disk2, 300) && getStr(f, h.rom, 300) && get(f, &h.ram, 4) &&
          get(f, &h.screen, 4) && get(f, h.gen, sizeof h.gen);
@@ -131,8 +141,6 @@ int numberOf(const char *file) {
   return end != file + 1 && !strcasecmp(end, ".snp") ? (int)n : -1;
 }
 
-int ioWrite(void *ctx, void *p, unsigned n) { return fwrite(p, 1, n, (FILE *)ctx) == n ? 0 : 1; }
-int ioRead(void *ctx, void *p, unsigned n) { return fread(p, 1, n, (FILE *)ctx) == n ? 0 : 1; }
 
 // ---- the screen's picture -----------------------------------------------------------------------
 
@@ -144,9 +152,9 @@ void le16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
 void le32(uint8_t *p, uint32_t v) { le16(p, v); le16(p + 2, v >> 16); }
 uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
-// The Mac's screen as sN.bmp: each picture pixel is the grey of the screen pixels it covers (the
-// screen is scaled to fit, keeping its shape). A failure only loses the picture.
-void savePicture(const std::string &snap, const uint8_t *fb, int w, int h) {
+// The Mac's screen as sN.bmp: each picture pixel is the average of the screen pixels it covers
+// (the screen is scaled to fit, keeping its shape). A failure only loses the picture.
+void savePicture(const std::string &snap, MacSnapPixel pixel, int w, int h) {
   const std::string path = pictureOf(snap);
   FILE *f = fopen(path.c_str(), "wb");
   if (!f) return;
@@ -176,12 +184,15 @@ void savePicture(const std::string &snap, const uint8_t *fb, int w, int h) {
       if (px < 0 || py < 0 || px >= pw || py >= ph) { row[tx] = 0; continue; }
       const int x0 = px * w / pw, x1 = std::max(x0 + 1, (px + 1) * w / pw);
       const int y0 = py * h / ph, y1 = std::max(y0 + 1, (py + 1) * h / ph);
-      int white = 0;
+      uint32_t r = 0, g = 0, b = 0;
       for (int y = y0; y < y1; y++)
-        for (int x = x0; x < x1; x++)
-          if (!(fb[(y * w + x) >> 3] & (0x80 >> (x & 7)))) white++;
-      const int v = white * 255 / ((x1 - x0) * (y1 - y0));
-      row[tx] = (uint16_t)(((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3));
+        for (int x = x0; x < x1; x++) {
+          const uint32_t c = pixel(x, y);
+          r += c >> 16 & 255; g += c >> 8 & 255; b += c & 255;
+        }
+      const uint32_t n = (uint32_t)((x1 - x0) * (y1 - y0));
+      r /= n; g /= n; b /= n;
+      row[tx] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
     }
     ok = put(f, row, sizeof row);               // RGB565 little-endian on every target
   }
@@ -270,7 +281,7 @@ std::vector<MacSnapshot> macsnap_list() {
 // ---- saving ----------------------------------------------------------------------------------------
 
 const char *macsnap_save(const std::string &name, const std::string &replace, const MacSnapMachine &m,
-                         const uint8_t *fb, int w, int h) {
+                         MacSnapPixel pixel, int w, int h, MacSnapWrite state) {
   const std::string dir = snapDir();
   if (!makeDirs(dir)) return "Cannot make the snapshot folder";
   int next = 1;
@@ -291,15 +302,15 @@ const char *macsnap_save(const std::string &name, const std::string &replace, co
 
   FILE *f = fopen(path.c_str(), "wb");
   if (!f) return "Cannot write the snapshot";
-  bool ok = put(f, kMagic, 8) && putStr(f, hd.name) && putStr(f, hd.disk) && putStr(f, hd.disk2) &&
+  bool ok = put(f, magic(), 8) && putStr(f, hd.name) && putStr(f, hd.disk) && putStr(f, hd.disk2) &&
             putStr(f, hd.rom) && put(f, &hd.ram, 4) && put(f, &hd.screen, 4) && put(f, hd.gen, sizeof hd.gen);
-  ok = ok && umac_save_state(ioWrite, f) == 0;
+  ok = ok && state(f);
   if (fclose(f) != 0) ok = false;
   if (!ok) {
     remove(path.c_str());
     return "Cannot write the snapshot (card full?)";
   }
-  savePicture(path, fb, w, h);
+  savePicture(path, pixel, w, h);
   // Overwriting saves a new one and then drops the old: a failed save above keeps it, and the
   // list (newest first) shows the overwritten one at the top.
   if (!replace.empty() && replace != path) {
@@ -314,7 +325,7 @@ const char *macsnap_save(const std::string &name, const std::string &replace, co
 
 bool macsnap_machine(const std::string &snap, MacSnapMachine &m) {
   Header h;
-  if (!readHeaderOf(snap, h) || h.ram >= RAM_COUNT || h.screen >= SCREEN_COUNT) return false;
+  if (!readHeaderOf(snap, h) || h.ram >= (uint32_t)(isII() ? RAM2_COUNT : RAM_COUNT) || h.screen >= SCREEN_COUNT) return false;
   m.disk = fullOf(h.disk);
   m.disk2 = fullOf(h.disk2);
   m.rom = h.rom;
@@ -329,12 +340,12 @@ bool macsnap_disks_changed(const std::string &snap) {
   return (!h.disk.empty() && genOf(h.disk) != h.gen[0]) || (!h.disk2.empty() && genOf(h.disk2) != h.gen[1]);
 }
 
-const char *macsnap_restore(const std::string &snap, bool *broken) {
+const char *macsnap_restore(const std::string &snap, bool *broken, MacSnapRead state) {
   *broken = false;
   FILE *f = fopen(snap.c_str(), "rb");
   if (!f) return "Cannot open the snapshot";
   Header h;
-  const int r = readHeader(f, h, false) ? umac_load_state(ioRead, f) : -2;
+  const int r = readHeader(f, h, false) ? state(f) : -2;
   fclose(f);
   if (r == -2) return "Snapshot from another version";
   if (r != 0) { *broken = true; return "Cannot read the snapshot"; }

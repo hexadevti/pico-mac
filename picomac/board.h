@@ -55,7 +55,11 @@
 
 #elif defined(BOARD_DESKTOP)
 
+#if defined(EMU_WEB)
+#define BOARD_NAME        "Browser"
+#else
 #define BOARD_NAME        "Desktop (SDL2)"
+#endif
 #define AUDIO_OUT_RATE    44100
 #ifndef EMU_DEFAULT_SD_DIR
 #define EMU_DEFAULT_SD_DIR "sdcard"

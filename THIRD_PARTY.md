@@ -79,6 +79,73 @@ Changes:
   copy files without a known extension.
 - **m68k_set_context_keep_hooks** (m68kcpu.c, m68k.h): loads a saved context but keeps the live
   cycle tables and callbacks (a snapshot's pointers are from another run).
+- For the Mac II's 68020 build (below), none of which changes the Plus's 68000:
+  - **CPU_HAS_FPU** (m68kcpu.h): the FPU opcodes are allowed on a 68020 when the config sets
+    `M68K_EMULATE_FPU` (a 68020 + 68881). Upstream only allows them from the 68030. The two FPU
+    handlers in m68kops.c and tools/musashi-gen/m68k_in.c test it instead of `CPU_TYPE_IS_030_PLUS`.
+  - **M68K_STATIC_INSTR_CYCLES** (m68kcpu.h): the cycles charged per instruction with static
+    tables, which was a fixed 8. It defaults to 8; the 68020 build uses 5.
+  - **fx80_normalize** (m68kfpu_inc.h): `fpgen_rm_reg` normalizes an unnormalized extended
+    operand (exponent set, integer bit clear) before the operation, as the 68881 does. Softfloat
+    assumes normal operands: floatx80_div's correction loop ran ~2^63/significand times, and
+    SimCity 2000's power grid froze the Mac II for minutes.
+  - **M68K_FIXED_CPU_API** (m68kcpu.c): with a fixed CPU type, `m68k_set_cpu_type` asserts against
+    this API value when it is defined, because `CPU_TYPE_020` (internal) differs from
+    `M68K_CPU_TYPE_68020` (the API).
+- For the Mac IIci's 68030 build: **M68K_MMU_HEADER** (m68kcpu.c): when the config defines it,
+  m68kcpu.c includes that header in place of m68kmmu.h. The IIci's maciici_mmu.h holds the PMMU
+  instructions there (PMOVE, PLOAD, PFLUSH, PTEST); the table walk and the translation cache are
+  in the core's bus. Without the define nothing changes.
+
+### The 68020 build (picomac/src/mac2/m68k*)
+
+The same Musashi sources, compiled a second time as a 68020 + 68881 for the Mac II core:
+m68kcpu020.c and m68kops020.c `#include` m68kcpu.c and m68kops.c with `MUSASHI_CNF` pointing at
+m68kconf020.h. That config fixes the CPU at the 68020, enables the FPU, and maps the bus to
+`macii_read*`/`macii_write*` (macii_bus.h). m68k020_names.h renames every global symbol
+(`m68k_*` → `m68k020_*`, `m68ki_*` → `m68k020i_*`) so that both CPUs link into one program. The
+softfloat code is shared. Each machine keeps its own fixed-type static jump table, so the Plus runs
+no slower.
+
+m68kconf020.h differs from umac's m68kconf.h in these ways:
+- `M68K_EMULATE_010` and `M68K_EMULATE_EC020` are ON. The CPU type is still a fixed 68020. With
+  them OFF, m68kcpu.h's `CPU_TYPE_IS_010_LESS` falls back to `CPU_TYPE_IS_020_LESS`, which is true
+  when there is no 030. The 68020 then decoded indexed addressing (and more) as a 68000 would.
+- `M68K_ILLG_HAS_CALLBACK` goes to `macii_illegal`. It handles opcodes 0x7110-0x7114, which our
+  video card's driver uses to call the emulator (as Basilisk II does), and it logs the rest.
+- `M68K_INSTRUCTION_HOOK` is on only in a debugging build (`-DMACII_PC_HISTORY`).
+- `M68K_SEPARATE_READS` is ON, and the memory macros go to inline functions in macii_bus.h:
+  RAM is read and written there without a call, and instruction fetches use a window over the RAM
+  or the ROM block the PC is in. Anything else goes to `macii_read*`/`macii_write*`.
+- m68kcpu.c dispatches through `M68K_DISPATCH(ir)`; it defaults to `instruction_jump_table[ir]()`
+  (the Plus, unchanged). The 020 config replaces it with a 16-bit index per opcode into the
+  distinct handlers, both built in RAM at start-up from the static table (in flash); on the P4 a
+  dispatch from flash was a slow cache miss.
+- `M68K_INSTRUCTION_HOOK` is also on in `-DMACII_OPCOUNT` (a desktop build that counts opcodes).
+- On the P4, `M68K_FAST_FUNC` in the 020 config puts code in IRAM, and macii_iram.h does the same
+  for the 300 handlers that ran most and m68kcpu.h's out-of-line helpers. It only adds declarations
+  with a section attribute; the Musashi sources are not edited for it.
+
+- The ILLG callback also takes opcodes 0x7120-0x7123, from our .Sony driver (below).
+
+### The 68030 build (picomac/src/mac2/m68k*030*, the Mac IIci; not on the P4)
+
+A third compile of the same sources, as the 020 build: m68kcpu030.c and m68kops030.c with
+m68kconf030.h (a fixed `CPU_TYPE_030`, the FPU, `HAS_PMMU`, and `M68K_MMU_HEADER` = maciici_mmu.h)
+and m68k030_names.h for the symbols (`m68k030_*`). maciici_core.cpp compiles macii_core.cpp again
+with `MACII_IICI` and maciici_names.h, so the IIci core is the Mac II's with its own memory map
+(the RBV in place of VIA2, two RAM banks, the video card in slot E) and the MMU.
+
+adb.h, ncr5380.h, rtc.h (the clock and XPRAM) and macii_slotrom.h (the card's declaration ROM and
+its driver) are new code written for pico-mac, not taken from other projects. asc.h (the Apple Sound
+Chip) is new code too, written after the register descriptions in MAME's asc.cpp (BSD-3-Clause);
+no MAME code is copied.
+
+macii_sony.h replaces the Mac II ROM's .Sony driver in memory (and fixes the ROM checksum), so
+that disk images boot as on umac. Its C++ side is a port of umac's disc.c, itself a cut-down
+version of Basilisk II's sony.cpp (Basilisk II (C) 1997-2008 Christian Bauer, GPLv2; umac MIT).
+The 68k driver is umac's sonydrv.S with opcodes 0x7120-0x7123 in place of its magic address,
+hand-assembled.
 
 ## Frontend
 

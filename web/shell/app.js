@@ -1,0 +1,1507 @@
+// pico-mac -- the browser shell (from pico-386's). It owns the page: the layout (portrait /
+// landscape beside / landscape over), the Mac's picture at its own resolution (512x342 for the Plus,
+// 640x480 for the Mac II) and the 320x320 panel read out of the wasm memory, the emulator's menus
+// drawn as touch screens (ui.cpp sends them as JSON, a tap answers with the key it stands for), the
+// physical keyboard and an on-screen Mac keyboard (both as PicoCalc key codes, so the cores map them
+// exactly as on the device), the screen as a touch screen (the pointer goes where the finger is) or
+// a touchpad, a trackpad (🖱) in the keyboard's place, the OPFS-backed /sdcard, uploads, "receive
+// from PC" and the audio (an AudioWorklet draining hal_web.cpp's ring through the SharedArrayBuffer).
+'use strict';
+
+const $ = (s) => document.querySelector(s);
+const app = $('#app'), canvas = $('#screen'), ctx = canvas.getContext('2d', { alpha: false });
+const bootMsg = $('#boot-msg');
+let M = null;                 // the Emscripten module once running
+let cardOpfs = false;         // /sdcard is the browser's private file system (fsInit)
+
+// a startup's ROM and Boot disk rows browse from picomac/ and its folders
+const FOLDERS = ['picomac', 'picomac/disks', 'picomac/roms'];
+
+// PicoCalc key codes (picomac/src/hal/hal.h). On the Mac: CTRL is Command, SYM Option, ALT the
+// mouse button, Esc the ` key (mac_core.cpp / macii_core.cpp).
+const K = {
+  BS: 0x08, TAB: 0x09, ENTER: 0x0a, ESC: 0xb1, LEFT: 0xb4, UP: 0xb5, DOWN: 0xb6, RIGHT: 0xb7,
+  ALT: 0xa1, SHIFT_L: 0xa2, SHIFT_R: 0xa3, SYM: 0xa4, CTRL: 0xa5, MCTRL: 0xa6, CAPS: 0xc1,
+  BREAK: 0xd0, INS: 0xd1, HOME: 0xd2, DEL: 0xd4, END: 0xd5, PGUP: 0xd6, PGDN: 0xd7,
+  F: [0, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x90],
+  RELEASE_ALL: 0x00,
+};
+
+if (!self.crossOriginIsolated) {
+  bootMsg.removeAttribute('data-i18n');
+  bootMsg.textContent = t('boot.noSAB');
+}
+
+// ======================= the card (OPFS) =======================
+// /sdcard is the browser's private file system (hal_web.cpp mountCard): every write is already on
+// the phone's storage, so there is nothing to save any more. persist() stays as the place a save
+// would go, for the callers that wait on one (Restart).
+function persist(cb) { if (cb) cb(); }
+
+// The page never calls Module.FS: on OPFS a call from this (the browser's main) thread blocks until
+// OPFS's own thread answers, and a phone hung there for good. Each request goes to a C thread
+// instead (hal_web.cpp fsThread, web_fs_req), which answers through Module.fsDone. Requests are
+// done in the order sent. A path and a write's data are copied into the wasm heap; C frees them.
+const FSOP = { MKDIRS: 0, STAT: 1, OPEN: 2, PWRITE: 3, CLOSE: 4, UNLINK: 5, READTEXT: 6, LIST: 7, PREAD: 8 };
+let fsMod = null, fsSeq = 0;
+const fsWait = new Map();
+const enc = new TextEncoder();
+function heapCopy(bytes, nul) {
+  const p = fsMod._malloc(bytes.length + (nul ? 1 : 0) || 1);
+  if (!p) throw new Error('out of memory');
+  fsMod.HEAPU8.set(bytes, p);
+  if (nul) fsMod.HEAPU8[p + bytes.length] = 0;
+  return p;
+}
+function fsCall(op, path, a = 0, off = 0, data = null, len = 0) {
+  const p = path == null ? 0 : heapCopy(enc.encode(path), true);
+  let buf = 0;
+  try { if (data) { buf = heapCopy(data, false); len = data.length; } } catch (e) { fsMod._free(p); throw e; }
+  const id = ++fsSeq;
+  return new Promise((res) => { fsWait.set(id, res); fsMod._web_fs_req(id, op, a, p, buf, len, off); });
+}
+function fsDone(id, r) { const f = fsWait.get(id); fsWait.delete(id); if (f) f(r); }
+const fsCheck = (r, what) => { if (r < 0) throw new Error(what + ': error ' + -r); return r; };
+const fsMkdirs = (path) => fsCall(FSOP.MKDIRS, path);
+const fsStat = (path) => fsCall(FSOP.STAT, path);            // the size; -1 missing; -2 a folder
+const fsExists = async (path) => (await fsStat(path)) !== -1;
+const fsUnlink = (path) => fsCall(FSOP.UNLINK, path);
+// for writing: made empty, and sized first when size > 0 (no regrowing as the pieces come)
+const fsOpenW = async (path, size) => fsCheck(await fsCall(FSOP.OPEN, path, 1, size || 0), path);
+const fsOpenR = async (path) => fsCheck(await fsCall(FSOP.OPEN, path, 0), path);
+const fsClose = (fd) => fsCall(FSOP.CLOSE, null, fd);
+async function fsPwrite(fd, data, off) {
+  if ((await fsCall(FSOP.PWRITE, null, fd, off, data)) !== data.length) throw new Error('write failed');
+}
+async function fsPread(fd, len, off) {
+  const p = fsMod._malloc(len || 1);
+  if (!p) throw new Error('out of memory');
+  try {
+    const n = fsCheck(await fsCall(FSOP.PREAD, null, fd, off, null, len), 'read');
+    return fsMod.HEAPU8.slice(p, p + n);
+  } finally { fsMod._free(p); }
+}
+// a C string the thread malloc'd, or null
+function takeStr(ptr) {
+  if (!ptr) return null;
+  const s = fsMod.UTF8ToString(ptr);
+  fsMod._free(ptr);
+  return s;
+}
+const fsReadText = async (path) => takeStr(await fsCall(FSOP.READTEXT, path));
+// A fetch's body into a file of the given size, PIECE by PIECE; the file is removed if it falls short.
+async function streamTo(path, body, size, onPct) {
+  const fd = await fsOpenW(path, size);
+  let off = 0, buf = new Uint8Array(0);
+  try {
+    const rd = body.getReader();
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (value) { const b = new Uint8Array(buf.length + value.length); b.set(buf); b.set(value, buf.length); buf = b; }
+      while (buf.length >= PIECE || (done && buf.length)) {
+        const n = Math.min(PIECE, buf.length);
+        await fsPwrite(fd, buf.subarray(0, n), off);
+        off += n; buf = buf.slice(n);
+        if (onPct) onPct(Math.floor(100 * off / Math.max(1, size)));
+      }
+      if (done) break;
+    }
+  } finally { await fsClose(fd); }
+  if (off !== size) { await fsUnlink(path); throw new Error(path + ': short'); }
+}
+async function fsList(dir) {
+  const s = takeStr(await fsCall(FSOP.LIST, dir)) || '';
+  return s.split('\n').filter(Boolean).map((l) => {
+    const [name, size, d] = l.split('\t');
+    return { name, size: Number(size), dir: d === '1' };
+  });
+}
+// Data goes in a PIECE at a time: each piece is copied through the wasm heap, which has no room
+// for a whole disk image.
+const PIECE = 4 * 1024 * 1024;
+async function fsWriteAll(path, data) {
+  const fd = await fsOpenW(path, data.length);
+  try { for (let off = 0; off < data.length; off += PIECE) await fsPwrite(fd, data.subarray(off, off + PIECE), off); }
+  finally { await fsClose(fd); }
+}
+
+// ======================= module =======================
+// The last lines the emulator and the page wrote, for 📁 → Log: a phone has no console to read.
+const LOG = [], LOG_MAX = 400;
+function logLine(s) {
+  LOG.push(new Date().toISOString().slice(11, 19) + ' ' + s);
+  if (LOG.length > LOG_MAX) LOG.splice(0, LOG.length - LOG_MAX);
+}
+window.addEventListener('error', (e) => logLine('page error: ' + e.message + ' (' + (e.filename || '') + ':' + (e.lineno || 0) + ')'));
+window.addEventListener('unhandledrejection', (e) => logLine('page error: ' + (e.reason && (e.reason.stack || e.reason.message) || e.reason)));
+function logText() {
+  let st = '';
+  try {
+    st = 'ui ' + uiMode + ', screen ' + screenKind + ', picture ' + (M ? M._web_pc_w() + 'x' + M._web_pc_h() + ' frame ' + M._web_pc_frame_no() : '-') +
+      ', drawn ' + lastPcFrame + ', sound ' + (actx ? actx.state + ' ' + actx.sampleRate + ' Hz' : 'off');
+  } catch (e) { st = String(e); }
+  return ['pico-mac ' + location.href, navigator.userAgent, 'isolated ' + self.crossOriginIsolated + ', ' + innerWidth + 'x' + innerHeight + ' @' + devicePixelRatio, st, ''].concat(LOG).join(String.fromCharCode(10));
+}
+function showLog() {
+  const box = el('div', 'log-box');
+  const pre = el('pre', null, logText());
+  const bar = el('div', 'log-bar');
+  const copy = el('button', null, t('log.copy')), close = el('button', null, t('log.close'));
+  copy.addEventListener('click', () => {
+    const done = () => { copy.textContent = t('log.copied'); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(pre.textContent).then(done, () => selectPre());
+    else selectPre();
+  });
+  const selectPre = () => { const r = document.createRange(); r.selectNodeContents(pre); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.execCommand('copy'); copy.textContent = t('log.copied'); };
+  close.addEventListener('click', () => box.remove());
+  bar.append(copy, close);
+  box.append(bar, pre);
+  document.body.append(box);
+  pre.scrollTop = pre.scrollHeight;
+}
+
+const moduleCfg = {
+  print: (s) => { logLine(s); console.log(s); },
+  printErr: (s) => { logLine(s); console.warn(s); },
+  // hal_reboot / hal_reboot_to_loader (home menu Restart, Ctrl+PgUp, Ctrl+F8): save, then reload
+  webReboot: () => persist(() => location.reload()),
+  webFiles: () => openFiles(),   // the home menu's Files row (hal_web_files)
+  // main() mounted /sdcard (hal_web.cpp mountCard) and waits for this to call web_fs_ready
+  webFsInit: (mod, opfs) => fsInit(mod, opfs),
+  fsDone,                        // the file thread's answers (hal_web.cpp fsThread)
+};
+
+async function fsInit(mod, opfs) {
+  fsMod = mod;
+  cardOpfs = !!opfs;
+  $('#boot').hidden = false;
+  bootMsg.removeAttribute('data-i18n');
+  bootMsg.textContent = t('boot.card');   // past this, a hang is in the page; before it, in mountCard
+  try {
+    if (opfs && navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    for (const f of FOLDERS) await fsMkdirs('/sdcard/' + f);
+    if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) await devPreload();
+    await seed();
+  } catch (e) { console.warn('card', e); }
+  $('#boot').hidden = true;
+  mod._web_fs_ready();
+}
+
+// The files a new visitor starts with (web/build.py writes seed/index.json; empty for pico-mac: the
+// ROMs and System disks are Apple's, so visitors bring their own). Copied only where missing.
+async function seed() {
+  let list;
+  try { const r = await fetch('seed/index.json', { cache: 'no-cache' }); if (!r.ok) return 0; list = await r.json(); } catch (e) { return 0; }
+  let n = 0;
+  for (const f of list) {
+    const dst = '/sdcard/' + f.path;
+    if (await fsExists(dst)) continue;
+    bootMsg.removeAttribute('data-i18n');
+    bootMsg.textContent = t('boot.seeding', f.path.split('/').pop());
+    const r = await fetch(f.url);
+    if (!r.ok) { console.warn('seed', f.url, r.status); continue; }
+    const body = f.gz ? r.body.pipeThrough(new DecompressionStream('gzip')) : r.body;
+    const data = new Uint8Array(await new Response(body).arrayBuffer());
+    if (data.length !== f.size) { console.warn('seed', f.path, 'size', data.length, '!=', f.size); continue; }
+    await fsMkdirs(dst.slice(0, dst.lastIndexOf('/')));
+    await fsWriteAll(dst, data);
+    n++;
+  }
+  return n;
+}
+
+// Local test server only (web/serve.py): copy the repo's sdcard/ files that are missing here, a
+// piece at a time (System 7.5.5's disk is 500 MB). Never over a file the emulator may have changed.
+async function devPreload() {
+  let list;
+  try { const r = await fetch('/__sdcard_list'); if (!r.ok) return; list = await r.json(); } catch (e) { return; }
+  for (const f of list) {
+    const dst = '/sdcard/' + f.path;
+    if (await fsExists(dst)) continue;
+    bootMsg.removeAttribute('data-i18n');
+    bootMsg.textContent = t('boot.copying', f.path);
+    const r = await fetch('/__sdcard/' + f.path.split('/').map(encodeURIComponent).join('/'));
+    if (!r.ok) continue;
+    await fsMkdirs(dst.slice(0, dst.lastIndexOf('/')));
+    await streamTo(dst, r.body, f.size, (p) => { bootMsg.textContent = t('boot.copying', f.path) + ' ' + p + '%'; });
+  }
+}
+
+createPicoMac(moduleCfg).then((mod) => {
+  M = mod;
+  requestAnimationFrame(frame);
+}).catch((e) => { bootMsg.removeAttribute('data-i18n'); bootMsg.textContent = t('boot.fail', e); });
+
+// Hidden (tab switched, app minimised, phone locked): the emulator and the audio pause, so the phone
+// isn't kept busy in the background; the PC carries on where it was (its clock skips the gap).
+function setHidden(h) {
+  if (M) M._web_hidden(h ? 1 : 0);
+  if (actx) { if (h) actx.suspend().catch(() => {}); else actx.resume().catch(() => {}); }
+  if (h) releaseAll();
+}
+document.addEventListener('visibilitychange', () => setHidden(document.hidden));
+window.addEventListener('pageshow', () => setHidden(document.hidden));
+window.addEventListener('pagehide', () => setHidden(true));
+
+// ======================= video =======================
+// Two pictures: the Mac's screen at its own resolution (512x342 on the Plus, 640x480 on the Mac II)
+// in a box of its own shape (square pixels), and the 320x320 panel for the few screens ui.cpp still
+// draws itself (progress bars, "press a key").
+const wrap = $('#screen-wrap'), pcCanvas = $('#pc'), pcCtx = pcCanvas.getContext('2d', { alpha: false });
+let lastFrame = -1, lastPcFrame = -1, pcImg = null;
+let pcAr = 512 / 342;                 // the Mac picture's width / height (the box's shape)
+let screenKind = 'panel';             // which picture the screen shows: 'panel' or 'pc'
+let uiMode = 'panel';                 // 'panel', 'pc' or 'menu' (#ui over everything)
+const img = new ImageData(320, 320);
+function frame() {
+  requestAnimationFrame(frame);
+  if (!M) return;
+  pollUi();
+  pollStatus();
+  const no = M._web_frame_no();
+  if (no !== lastFrame) {
+    lastFrame = no;
+    const ptr = M._web_frame_ptr();
+    img.data.set(M.HEAPU8.subarray(ptr, ptr + 320 * 320 * 4));
+    ctx.putImageData(img, 0, 0);
+  }
+  const pno = M._web_pc_frame_no();
+  if (pno !== lastPcFrame) {
+    lastPcFrame = pno;
+    const w = M._web_pc_w(), h = M._web_pc_h();
+    if (w > 0 && h > 0) {
+      if (!pcImg || pcImg.width !== w || pcImg.height !== h) {
+        pcImg = new ImageData(w, h);
+        natCanvas.width = w; natCanvas.height = h;
+        if (Math.abs(w / h - pcAr) > 0.001) { pcAr = w / h; layout(); }
+      }
+      const ptr = M._web_pc_frame_ptr();
+      pcImg.data.set(M.HEAPU8.subarray(ptr, ptr + w * h * 4));
+      natCtx.putImageData(pcImg, 0, 0);
+      drawPc();
+    }
+  }
+}
+
+// The Mac's picture fills the largest box of its shape the screen area holds. The guest's picture stays at its own resolution
+// (natCanvas) and is scaled "sharp-bilinear": first by whole numbers with no smoothing, to the
+// first size at least as big as the box (midCanvas: each guest pixel an even block), then smoothly
+// down to the box in device pixels, so only the blocks' edges are blended. Plain nearest-neighbour to a fractional size makes some pixels
+// a column wider than others (uneven lines in 320x200); plain bilinear blurs all of them.
+const natCanvas = document.createElement('canvas'), natCtx = natCanvas.getContext('2d', { alpha: false });
+const midCanvas = document.createElement('canvas'), midCtx = midCanvas.getContext('2d', { alpha: false });
+let boxW = 0, boxH = 0;                  // the box in device pixels
+// Pinch zoom (two fingers on the screen): the scale, and the view's top-left as a fraction of the
+// picture. drawPc scales only the part in view, so a zoomed picture is as sharp as the whole one.
+let zoom = 1, zu = 0, zv = 0;
+function fitPc() {
+  const r = wrap.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  let w = r.width, h = w / pcAr;
+  if (h > r.height) { h = r.height; w = h * pcAr; }
+  // landscape: the picture fills its whole area, stretched if need be (drawPc scales x and y apart, in
+  // device pixels, so it stays as sharp as it can)
+  if (app.classList.contains('land')) { w = r.width; h = r.height; }
+  pcCanvas.style.width = w + 'px'; pcCanvas.style.height = h + 'px';
+  boxW = Math.max(1, Math.round(w * devicePixelRatio));
+  boxH = Math.max(1, Math.round(h * devicePixelRatio));
+  drawPc();
+}
+function drawPc() {
+  if (!pcImg || !boxW) return;
+  const w = pcImg.width, h = pcImg.height;
+  if (pcCanvas.width !== boxW || pcCanvas.height !== boxH) { pcCanvas.width = boxW; pcCanvas.height = boxH; }
+  // the guest pixels in view, widened to whole pixels, and how many device pixels each one takes
+  const sw = w / zoom, sh = h / zoom, sx = zu * w, sy = zv * h;
+  const x0 = Math.floor(sx), y0 = Math.floor(sy);
+  const cw = Math.min(w, Math.ceil(sx + sw)) - x0, ch = Math.min(h, Math.ceil(sy + sh)) - y0;
+  const px = boxW / sw, py = boxH / sh;
+  const kx = Math.max(1, Math.ceil(px - 0.01)), ky = Math.max(1, Math.ceil(py - 0.01));
+  let src = natCanvas, sr = [x0, y0, cw, ch];
+  if (kx > 1 || ky > 1) {
+    if (midCanvas.width !== cw * kx || midCanvas.height !== ch * ky) { midCanvas.width = cw * kx; midCanvas.height = ch * ky; }
+    midCtx.imageSmoothingEnabled = false;
+    midCtx.drawImage(natCanvas, x0, y0, cw, ch, 0, 0, cw * kx, ch * ky);
+    src = midCanvas; sr = [0, 0, cw * kx, ch * ky];
+  }
+  pcCtx.imageSmoothingEnabled = true;
+  pcCtx.imageSmoothingQuality = 'high';
+  pcCtx.drawImage(src, ...sr, (x0 - sx) * px, (y0 - sy) * py, cw * px, ch * py);
+}
+function resetZoom() { if (zoom !== 1) { zoom = 1; zu = zv = 0; drawPc(); } }
+new ResizeObserver(fitPc).observe(wrap);
+
+// ---- the status lines over the picture: the 2 s note (mouse mode, zoom) and the FPS meter
+const stEl = [$('#st-note'), $('#st-fps')], stNo = [-1, -1], stAt = [0, 0];
+function pollStatus() {
+  const now = performance.now();
+  for (let s = 0; s < 2; s++) {
+    const n = M._web_status_no(s);
+    if (n !== stNo[s]) {
+      stNo[s] = n; stAt[s] = now;
+      stEl[s].textContent = M.UTF8ToString(M._web_status(s));
+      stEl[s].classList.remove('off');
+    } else if (now - stAt[s] > (s ? 3000 : 2500)) stEl[s].classList.add('off');
+  }
+}
+
+// ======================= menus as touch screens =======================
+// ui.cpp publishes each screen as JSON with a sequence number: {"t":"pc"} (a PC runs), {"t":"panel"}
+// (it draws on the panel itself), and "list", "msg" and "edit", which this draws. A tap answers
+// (seq, key, row) with the key a PicoCalc would have sent there, so the C++ callers run unchanged.
+// The JSON is read like a seqlock: a screen replaced while it was read is read again next frame.
+const ICONS = { 1: '🎮', 2: '⚙️', 3: '🚪', 4: '📁', 5: '⬆️', 6: '💾', 7: '▶️', 8: '🔄', 9: '💾', 10: '📂',
+  11: '🔊', 12: '⏭️', 13: '📊', 14: '⏏️' };
+const uiEl = $('#ui'), uiBody = $('#ui-body'), uiBack = $('#ui-back'), uiClose = $('#ui-close');
+let uiSeq = 0, uiAnswered = 0, uiKind = '', uiListKey = '', uiTitle = null, uiBackKey = K.ESC;
+
+function pollUi() {
+  const s = M._web_ui_seq();
+  if (s === uiSeq) return;
+  const txt = M.UTF8ToString(M._web_ui_json(s));
+  if (M._web_ui_seq() !== s) return;
+  let j;
+  try { j = JSON.parse(txt); } catch (e) { return; }
+  uiSeq = s;
+  if (j.t === 'pc' || j.t === 'panel') {
+    setMode(j.t);
+  } else {
+    setMode('menu');
+    if (j.t === 'list') renderList(j);
+    else if (j.t === 'msg') renderMsg(j);
+    else if (j.t === 'edit') renderEdit(j);
+  }
+}
+
+function uiReply(key, sel = 0) {
+  if (!M || uiAnswered === uiSeq) return;   // one answer a screen
+  uiAnswered = uiSeq;
+  M._web_ui_reply(uiSeq, key, sel);
+}
+
+function setMode(m) {
+  if (m === 'pc' || m === 'panel') {
+    if (screenKind !== m) {
+      screenKind = m;
+      if (m !== 'pc') resetZoom();
+      canvas.hidden = m !== 'panel';
+      pcCanvas.hidden = m !== 'pc';
+    }
+  }
+  if (m === uiMode) return;
+  uiMode = m;
+  uiEl.hidden = m !== 'menu';
+  if (m !== 'menu') { uiKind = ''; uiListKey = ''; uiTitle = null; if (document.activeElement && uiEl.contains(document.activeElement)) document.activeElement.blur(); }
+  // the touchpad's buttons only while a PC runs
+  $('#mbtns').hidden = m !== 'pc';
+  if (m !== 'pc' && document.pointerLockElement === wrap) document.exitPointerLock();
+  if (m !== 'pc') releaseAll();
+  layout();
+}
+
+function setHead(title, sub, backKey, backLabel, closeToo) {
+  $('#ui-title').textContent = title || '';
+  $('#ui-sub').textContent = sub || '';
+  uiBack.classList.toggle('hide', !backKey);
+  uiBackKey = backKey;
+  uiBack.title = backLabel || t('ui.back');
+  uiClose.hidden = !closeToo;
+}
+uiBack.addEventListener('click', () => { if (uiBackKey) uiReply(uiBackKey); });
+uiClose.addEventListener('click', () => uiReply(K.ESC));
+
+// hints are "Enter|Select;Bs|Up;Esc|Back": which keys the screen takes, and what they mean
+function hintOf(hints, cap) {
+  for (const h of (hints || '').split(';')) { const [k, l] = h.split('|'); if (k === cap) return l || cap; }
+  return null;
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+
+// a row's picture (a snapshot's screen): RGB565 little-endian, base64
+function pictureOf(r) {
+  const c = el('canvas', 'ui-pic');
+  c.width = r.pw; c.height = r.ph;
+  const bin = atob(r.p), im = new ImageData(r.pw, r.ph), d = im.data;
+  for (let i = 0, o = 0; i + 1 < bin.length && o < d.length; i += 2, o += 4) {
+    const v = bin.charCodeAt(i) | bin.charCodeAt(i + 1) << 8;
+    d[o] = (v >> 11) * 255 / 31; d[o + 1] = (v >> 5 & 63) * 255 / 63; d[o + 2] = (v & 31) * 255 / 31; d[o + 3] = 255;
+  }
+  c.getContext('2d').putImageData(im, 0, 0);
+  c.style.height = '48px'; c.style.width = Math.round(48 * r.pw / r.ph) + 'px';
+  return c;
+}
+
+function renderList(j) {
+  const bs = hintOf(j.hints, 'Bs'), esc = hintOf(j.hints, 'Esc');
+  // Backspace goes up a folder in the browser; then ✕ leaves it (Esc)
+  setHead(j.logo ? '' : j.title, j.logo ? '' : j.subtitle, bs ? K.BS : esc ? K.ESC : 0, bs || esc, !!(bs && esc));
+  const key = j.title + '\u0001' + j.subtitle + '\u0001' + JSON.stringify(j.rows);
+  const rows = uiBody.querySelectorAll('.ui-row');
+  if (uiKind === 'list' && key === uiListKey && rows.length === j.rows.length) {
+    // the same rows (a key moved the selection, or a refresh): only the highlight moves
+    rows.forEach((r, i) => r.classList.toggle('sel', i === j.sel));
+    if (rows[j.sel]) rows[j.sel].scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  const keepScroll = uiKind === 'list' && uiTitle === j.title ? uiBody.scrollTop : -1;
+  uiKind = 'list'; uiListKey = key; uiTitle = j.title;
+  uiBody.innerHTML = '';
+  const w = el('div', 'ui-wrap');
+  if (j.logo) {
+    const hero = el('div', 'ui-hero');
+    hero.append(el('h1', null, j.title));
+    if (j.subtitle) hero.append(el('p', null, j.subtitle));
+    w.append(hero);
+  }
+  j.rows.forEach((r, i) => {
+    const b = el('div', 'ui-row' + (i === j.sel ? ' sel' : ''));
+    b.setAttribute('role', 'button');
+    if (r.p && r.pw && r.ph) b.append(pictureOf(r));
+    else if (r.i && ICONS[r.i]) b.append(el('div', 'ui-ico', ICONS[r.i]));
+    const tx = el('div', 'ui-txt');
+    tx.append(el('b', null, r.l));
+    if (r.s) tx.append(el('small', null, r.s));
+    b.append(tx);
+    if (r.m !== undefined && r.m >= 0) {
+      const m = el('div', 'ui-meter');
+      for (let k = 0; k < 10; k++) m.append(el('i', k < r.m ? 'on' : ''));
+      b.append(m);
+    }
+    if (r.a) {
+      // a value changed in place: ◀ ▶ are Left/Right on this row
+      const a = el('div', 'ui-adj');
+      const mk = (txt, code) => {
+        const x = el('button', null, txt);
+        x.addEventListener('click', (e) => { e.stopPropagation(); uiReply(code, i); });
+        return x;
+      };
+      a.append(mk('◀', K.LEFT));
+      if (r.v) a.append(el('span', 'ui-val', r.v));
+      a.append(mk('▶', K.RIGHT));
+      b.append(a);
+    } else {
+      if (r.v) b.append(el('span', 'ui-val', r.v));
+      b.append(el('span', 'ui-chev', '›'));
+    }
+    b.addEventListener('click', () => uiReply(K.ENTER, i));
+    w.append(b);
+  });
+  uiBody.append(w);
+  if (keepScroll >= 0) uiBody.scrollTop = keepScroll;
+  else { uiBody.scrollTop = 0; const s = w.querySelectorAll('.ui-row')[j.sel]; if (s && j.sel > 0) s.scrollIntoView({ block: 'center' }); }
+}
+
+function renderMsg(j) {
+  uiKind = 'msg'; uiListKey = ''; uiTitle = null;
+  setHead('', '', 0);
+  uiBody.innerHTML = '';
+  const c = el('div', 'ui-card');
+  c.append(el('h2', null, j.title || ''));
+  if (j.line) c.append(el('p', null, j.line));
+  uiBody.append(c);
+}
+
+// A name typed with the phone's own keyboard; only the final text goes back, at OK.
+function renderEdit(j) {
+  uiKind = 'edit'; uiListKey = ''; uiTitle = null;
+  setHead(j.title, '', K.ESC, t('ui.cancel'));
+  uiBody.innerHTML = '';
+  const c = el('div', 'ui-card');
+  if (j.prompt) c.append(el('p', null, j.prompt));
+  const inp = el('input');
+  inp.type = 'text'; inp.value = j.text || ''; inp.maxLength = Math.max(1, j.cap || 63);
+  inp.autocomplete = 'off'; inp.spellcheck = false; inp.setAttribute('autocapitalize', 'off');
+  const act = el('div', 'ui-actions');
+  const cancel = el('button', null, t('ui.cancel')), ok = el('button', 'primary', t('ui.ok'));
+  const done = () => {
+    const v = inp.value.trim();
+    if (!v) { inp.focus(); return; }
+    M.stringToUTF8(v, M._web_ui_textbuf(), 256);
+    uiReply(K.ENTER);
+  };
+  ok.addEventListener('click', done);
+  cancel.addEventListener('click', () => uiReply(K.ESC));
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); done(); }
+    else if (e.key === 'Escape') { e.preventDefault(); uiReply(K.ESC); }
+  });
+  act.append(cancel, ok);
+  c.append(inp, act);
+  uiBody.append(c);
+  setTimeout(() => { inp.focus(); inp.select(); }, 50);
+}
+
+// ======================= layout =======================
+let kbdOn = true;
+let padOn = false;                    // 🖱: the trackpad in the keyboard's place
+let gameOn = false;                   // 🎮: the game keyboard in the PC keyboard's place
+let wasLand = null;                   // the last layout's orientation
+function layout() {
+  const W = window.innerWidth, H = window.innerHeight;
+  // sideways starts with the Mac keyboard hidden (it would cover the screen; ⌨ shows it), the game
+  // keys stay; upright brings it back
+  if ((W > H) !== wasLand) {
+    wasLand = W > H;
+    if (wasLand && !gameOn) kbdOn = false;
+    else if (!wasLand && !padOn) kbdOn = true;
+  }
+  app.classList.remove('portrait', 'land', 'lgame', 'lkbd');
+  // the screen's box: square for the panel, the Mac picture's own shape for the Mac
+  const ar = screenKind === 'pc' ? pcAr : 1;
+  app.style.setProperty('--ar', String(ar));
+  let pad = padOn;
+  if (H >= W) {
+    app.classList.add('portrait');
+    // the screen at the full width in every mode (only a very short window caps it, at 70% of the
+    // height); the keyboard's rows, the game keys or the trackpad share what it leaves
+    const scr = Math.min(W / ar, H * 0.7);
+    app.style.setProperty('--scrh', scr + 'px');
+    app.style.setProperty('--kh', Math.max(30, Math.min(62, (H - scr - 100) / 5.4)) + 'px');
+  } else {
+    // landscape: the picture is stretched to its whole area (fitPc). Game keys: the screen in the
+    // middle, the action keys at its left, the toolbar and the pad at its right. Otherwise: the screen
+    // at the left in 3/4 of the width, the toolbar, the mouse button and the trackpad in the quarter at
+    // its right; the Mac keyboard lies over the screen's bottom (⌨ hides it and shows it again)
+    app.classList.add('land');
+    const game = gameOn && kbdOn && !padOn;
+    const side = Math.round(game ? Math.max(110, W * 0.15) : W / 4);
+    app.style.setProperty('--side', side + 'px');
+    app.classList.toggle('lgame', game);
+    app.classList.toggle('lkbd', kbdOn && !gameOn && !padOn);
+    app.style.setProperty('--kh', Math.max(26, Math.min(38, H / 11)) + 'px');
+    pad = !game;
+  }
+  app.classList.toggle('padmode', pad);
+  $('#pad').hidden = !pad;
+  kbd.hidden = !kbdOn || padOn;
+  if (kbd.classList.contains('game') !== gameOn) buildKbd();
+  $('[data-act=kbd]').classList.toggle('on', kbdOn && !padOn && !gameOn);
+  $('[data-act=game]').classList.toggle('on', kbdOn && gameOn && !padOn);
+  $('[data-act=mouse]').classList.toggle('on', padOn);
+  requestAnimationFrame(fitPc);
+}
+window.addEventListener('resize', layout);
+window.addEventListener('orientationchange', () => setTimeout(layout, 200));
+
+// ======================= keys =======================
+function key(code, down) { if (M) M._web_key(code, down ? 1 : 0); }
+function tapKey(code, mods = []) {
+  mods.forEach((m) => key(m, true));
+  key(code, true);
+  setTimeout(() => { key(code, false); mods.forEach((m) => key(m, false)); }, 80);
+}
+
+// The physical keyboard, as the desktop build sends it (hal_sdl.cpp): special keys by name, the rest
+// as the character typed. Ctrl is the Mac's Command and Alt its Option. Letters follow the
+// browser's Shift and Caps Lock (the Mac cores take no Caps Lock key). The core repeats held keys,
+// so the browser's repeats are dropped; a release goes by e.code to whatever its press sent.
+const SPECIAL = {
+  Enter: K.ENTER, Backspace: K.BS, Tab: K.TAB, Escape: K.ESC,
+  ArrowLeft: K.LEFT, ArrowUp: K.UP, ArrowDown: K.DOWN, ArrowRight: K.RIGHT,
+  Control: K.CTRL, Alt: K.SYM, AltGraph: K.SYM, Insert: K.INS, Home: K.HOME, Delete: K.DEL,
+  End: K.END, PageUp: K.PGUP, PageDown: K.PGDN, Pause: K.BREAK,
+  F1: K.F[1], F2: K.F[2], F3: K.F[3], F4: K.F[4], F5: K.F[5], F6: K.F[6], F7: K.F[7], F8: K.F[8], F9: K.F[9], F10: K.F[10],
+};
+const dialogOpen = () => !$('#files').hidden || !$('#boot').hidden ||
+  (document.activeElement && document.activeElement.tagName === 'INPUT');
+const downByCode = new Map();          // e.code -> the code its press sent
+function codeOf(e) {
+  if (e.key === 'Shift') return e.code === 'ShiftRight' ? K.SHIFT_R : K.SHIFT_L;
+  if (SPECIAL[e.key] !== undefined) return SPECIAL[e.key];
+  if (e.key && e.key.length === 1) {
+    let c = e.key;
+    if (/[a-z]/i.test(c)) c = e.shiftKey !== !!(e.getModifierState && e.getModifierState('CapsLock')) ? c.toUpperCase() : c.toLowerCase();
+    const n = c.charCodeAt(0);
+    if (n >= 32 && n < 127) return n;
+  }
+  return 0;
+}
+window.addEventListener('keydown', (e) => {
+  if (dialogOpen() || e.metaKey) return;
+  const c = codeOf(e);
+  if (!c) return;
+  e.preventDefault();
+  if (e.repeat || downByCode.has(e.code)) return;
+  downByCode.set(e.code, c);
+  key(c, true);
+});
+window.addEventListener('keyup', (e) => {
+  const c = downByCode.get(e.code);
+  if (c === undefined) return;
+  e.preventDefault();
+  downByCode.delete(e.code);
+  key(c, false);
+});
+function releaseAll() {
+  for (const c of downByCode.values()) key(c, false);
+  downByCode.clear();
+  releaseLatched();
+  absBtn = 0; mouseBtn = 0; clearTimeout(absHold); absGen++;
+  setButtons(0);
+}
+window.addEventListener('blur', releaseAll);
+
+// ======================= on-screen keyboard =======================
+// Kinds of key: a character (c, with sc the one Shift gives), a fixed code, or a modifier that
+// latches until the next key (⌘, ⌥, Shift). A key is held while the finger stays on it, so the
+// core's repeat works as on the device. Caps is the page's own: it makes the letters capitals.
+// A Mac keyboard: no function keys; ⌘ is the PicoCalc's Ctrl, ⌥ its Sym, Esc the ` key.
+const CH = (c, sc, w = 1) => ({ l: c, c, sc, top: sc, w });
+const KC = (l, code, w = 1, cls = 'mod') => ({ l, code, w, cls });
+const MOD = (l, code, w = 1) => ({ l, code, w, cls: 'mod', latch: true });
+const letters = (s) => s.split('').map((c) => ({ l: c.toUpperCase(), c, w: 1 }));
+const CAPS = { l: 'Caps', w: 1.6, cls: 'mod', caps: true };
+const ROWS = [
+  [CH('`', '~'), ...'1234567890'.split('').map((c, i) => CH(c, '!@#$%^&*()'[i])), CH('-', '_'), CH('=', '+'), KC('⌫', K.BS, 1.5)],
+  [KC('Tab', K.TAB, 1.4), ...letters('qwertyuiop'), CH('[', '{'), CH(']', '}'), CH('\\', '|')],
+  [CAPS, ...letters('asdfghjkl'), CH(';', ':'), CH("'", '"'), KC('↵', K.ENTER, 1.8)],
+  [MOD('Shift', K.SHIFT_L, 2), ...letters('zxcvbnm'), CH(',', '<'), CH('.', '>'), CH('/', '?'), KC('↑', K.UP, 1.2)],
+  [MOD('⌃', K.MCTRL, 1.2), MOD('⌥', K.SYM, 1.2), MOD('⌘', K.CTRL, 1.4), { l: '', code: 0x20, w: 4.2 }, KC('←', K.LEFT), KC('↓', K.DOWN), KC('→', K.RIGHT)],
+];
+
+// The game keyboard (🎮): the keys games use, big, about where they sit on a real keyboard (WASD at
+// the left, the arrows at the right), on a 14-column grid: x, y and the width in columns. Its ⌘,
+// Shift, Ctrl (the Mac's Control, Mac II only) and ⌥ are held while the finger stays on them (fire, run), not latched; Click is the mouse
+// button (the PicoCalc's Alt), for the games that fire with it. The arrows are a
+// 3x3 pad whose corners hold two arrows at once (codes), for diagonal moves; its middle is a
+// second Down, so all four arrows sit in an inverted T as on a keyboard. A finger that slides from
+// one arrow to another changes the direction (pad keys), as on a game pad's cross.
+// In landscape (land) a simpler set of big keys sits at both sides of the screen: S() gives each its
+// side and place there, 'r' at the left (2 columns: Esc ⇄, Shift Ctrl, ⌘ Enter, Click, Space) and 'l'
+// at the right (the 3x3 pad, which ⇄ turns into letters, under the toolbar). The keys with no S() are
+// upright only.
+const GK = (l, code, x, y, w = 2, cls) => ({ l, code, x, y, w, cls });
+// dirs: the pad key's directions (0 up, 1 left, 2 down, 3 right), for the letter pad (gameSwap)
+const GD = (l, a, b, x, y, dirs) => ({ l, arrow: l, codes: [a, b], arrows: [a, b], dirs, x, y, w: 2, cls: 'diag', pad: true });
+const GA = (l, code, x, y, dir) => ({ l, arrow: l, codes: [code], arrows: [code], dirs: [dir], x, y, w: 2, pad: true });
+const S = (k, side, x, y, w = 2) => Object.assign(k, { side, sx: x, sy: y, sw: w });
+// The four movement letters (dir: up, left, down, right) follow MOVE_SETS[moveSet]; the ⇄ key steps
+// through them (kept in localStorage): WASD, ESDF (the home row), IJKL, ZQSD (AZERTY's WASD) and
+// QAOP (Q up, A down, O left, P right, as many 8-bit games).
+const GM = (dir, x, y) => ({ dir, x, y, w: 2 });
+const MOVE_SETS = [
+  { name: 'WASD', keys: 'wasd' }, { name: 'ESDF', keys: 'esdf' }, { name: 'IJKL', keys: 'ijkl' },
+  { name: 'ZQSD', keys: 'zqsd' }, { name: 'QAOP', keys: 'qoap' },
+];
+let moveSet = Math.max(0, MOVE_SETS.findIndex((m) => m.name === localStorage.getItem('picomac-move')));
+// A tap on ⇄ turns the arrow pad into the movement letters (↑ W, ← A, ↓ S, → D, the corners two
+// letters) and back; a 2 s hold steps the letters instead. Both are kept.
+let gameSwap = localStorage.getItem('picomac-gswap') === '1';
+const GAME = [
+  S(GK('Esc', K.ESC, 1, 1, 2, 'mod'), 'r', 1, 1, 1), S({ l: '', top: '⇄', cycle: true, x: 3, y: 1, w: 2, cls: 'mod cyc' }, 'r', 2, 1, 1), GM(0, 5, 1), S(GK('Click', K.ALT, 7, 1, 2, 'mod'), 'r', 1, 4, 2),
+  GK('⌫', K.BS, 9, 1, 2, 'mod'), S(GK('Enter', K.ENTER, 11, 1, 4, 'mod'), 'r', 2, 3, 1),
+  GK('Tab', K.TAB, 1, 2, 2, 'mod'), GM(1, 3, 2), GM(2, 5, 2), GM(3, 7, 2),
+  S(GD('↖', K.UP, K.LEFT, 9, 2, [0, 1]), 'l', 1, 1, 1), S(GA('↑', K.UP, 11, 2, 0), 'l', 2, 1, 1), S(GD('↗', K.UP, K.RIGHT, 13, 2, [0, 3]), 'l', 3, 1, 1),
+  S(GK('Shift', K.SHIFT_L, 1, 3, 4, 'mod'), 'r', 1, 2, 1), S(GK('Ctrl', K.MCTRL, 5, 3, 4, 'mod'), 'r', 2, 2, 1),
+  S(GA('←', K.LEFT, 9, 3, 1), 'l', 1, 2, 1), S(GA('↓', K.DOWN, 11, 3, 2), 'l', 2, 2, 1), S(GA('→', K.RIGHT, 13, 3, 3), 'l', 3, 2, 1),
+  S(GK('⌘', K.CTRL, 1, 4, 2, 'mod'), 'r', 1, 3, 1), GK('⌥', K.SYM, 3, 4, 2, 'mod'), S(GK('Space', 0x20, 5, 4, 4), 'r', 1, 5, 2),
+  S(GD('↙', K.DOWN, K.LEFT, 9, 4, [2, 1]), 'l', 1, 3, 1), S(GA('↓', K.DOWN, 11, 4, 2), 'l', 2, 3, 1), S(GD('↘', K.DOWN, K.RIGHT, 13, 4, [2, 3]), 'l', 3, 3, 1),
+];
+
+const kbd = $('#kbd');
+const latched = new Set();
+function setLatch(code, on) {
+  if (on) latched.add(code); else latched.delete(code);
+  key(code, on);
+  kbd.querySelectorAll(`[data-latch="${code}"]`).forEach((x) => x.classList.toggle('latch', on));
+}
+function releaseLatched() { for (const c of [...latched]) setLatch(c, false); }
+
+let capsOn = false;
+function setCaps(on) { capsOn = on; kbd.querySelectorAll('[data-caps]').forEach((x) => x.classList.toggle('latch', on)); }
+function oskCode(k) {
+  if (k.c === undefined) return k.code;
+  const sh = latched.has(K.SHIFT_L);
+  let c = sh && k.sc ? k.sc : k.c;
+  if (sh !== capsOn && /[a-z]/.test(c)) c = c.toUpperCase();
+  return c.charCodeAt(0);
+}
+
+function makeKey(k) {
+  const b = document.createElement('button');
+  b.className = 'k' + (k.cls ? ' ' + k.cls : '');
+  if (k.top) { const s = document.createElement('small'); s.textContent = k.top; b.appendChild(s); }
+  const m = document.createElement('span'); m.textContent = k.l; b.appendChild(m);
+  if (k.cycle) {
+    let hold = 0;
+    b.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      try { b.setPointerCapture(e.pointerId); } catch (_) {}
+      b.classList.add('down');
+      clearTimeout(hold);
+      hold = setTimeout(() => {
+        hold = 0;
+        moveSet = (moveSet + 1) % MOVE_SETS.length;
+        try { localStorage.setItem('picomac-move', MOVE_SETS[moveSet].name); } catch (_) {}
+        buildKbd();
+      }, 2000);
+    });
+    const up = (e) => {
+      b.classList.remove('down');
+      if (!hold) return;                 // the hold already changed the letters
+      clearTimeout(hold); hold = 0;
+      if (e.type !== 'pointerup') return;
+      gameSwap = !gameSwap;
+      try { localStorage.setItem('picomac-gswap', gameSwap ? '1' : '0'); } catch (_) {}
+      buildKbd();
+    };
+    b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up);
+  } else if (k.caps) {
+    b.dataset.caps = '1';
+    if (capsOn) b.classList.add('latch');
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); setCaps(!capsOn); });
+  } else if (k.latch) {
+    b.dataset.latch = k.code;
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); setLatch(k.code, !latched.has(k.code)); });
+  } else {
+    let downAt = 0, sent = null;      // the codes the press sent (two for a diagonal arrow)
+    let cur = b;                      // the key the finger is on: another pad key after a slide
+    b.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      try { b.setPointerCapture(e.pointerId); } catch (_) {}
+      if (sent) return;
+      cur = b;
+      b.classList.add('down');
+      downAt = performance.now();
+      sent = k.codes || [oskCode(k)];
+      sent.forEach((c) => key(c, true));
+    });
+    if (k.pad) {
+      b._codes = k.codes;
+      // the capture keeps the moves here: look for the pad key under the finger (off the pad, the
+      // last one stays held)
+      b.addEventListener('pointermove', (e) => {
+        if (!sent) return;
+        const t = document.elementFromPoint(e.clientX, e.clientY);
+        const n = t && t.closest('#kbd .k');
+        if (!n || n === cur || !n._codes) return;
+        const next = n._codes;
+        sent.filter((c) => !next.includes(c)).forEach((c) => key(c, false));
+        next.filter((c) => !sent.includes(c)).forEach((c) => key(c, true));
+        sent = next;
+        cur.classList.remove('down'); n.classList.add('down'); cur = n;
+      });
+    }
+    const up = () => {
+      if (!sent) return;
+      const cs = sent; sent = null;
+      cur.classList.remove('down');
+      // let the guest see the press before the release (and the latches after both)
+      const wait = Math.max(0, 70 - (performance.now() - downAt));
+      setTimeout(() => { cs.forEach((c) => key(c, false)); if (latched.size) setTimeout(releaseLatched, 30); }, wait);
+    };
+    b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up);
+  }
+  b.addEventListener('contextmenu', (e) => e.preventDefault());
+  return b;
+}
+
+function buildKbd() {
+  releaseLatched();
+  kbd.innerHTML = '';
+  kbd.classList.toggle('game', gameOn);
+  if (gameOn) {
+    // both places are set; the CSS picks one (the portrait grid, or land's two side grids)
+    const half = { l: document.createElement('div'), r: document.createElement('div') };
+    half.l.className = 'gl'; half.r.className = 'gr';
+    const set = MOVE_SETS[moveSet];
+    for (const k of GAME) {
+      if (k.dir !== undefined) { k.c = set.keys[k.dir]; k.l = k.c.toUpperCase(); }
+      if (k.cycle) k.l = set.name;
+      if (k.dirs) {                    // the pad: arrows, or the same moves as letters
+        const ch = k.dirs.map((d) => set.keys[d]);
+        k.codes = gameSwap ? ch.map((c) => c.charCodeAt(0)) : k.arrows;
+        k.l = gameSwap ? ch.join('').toUpperCase() : k.arrow;
+        k.top = gameSwap ? k.arrow : undefined;
+      }
+      const b = makeKey(k);
+      b.style.setProperty('--pc', `${k.x} / span ${k.w}`);
+      b.style.setProperty('--pr', String(k.y));
+      b.style.setProperty('--sc', `${k.sx} / span ${k.sw}`);
+      b.style.setProperty('--sr', String(k.sy));
+      if (!k.side) b.classList.add('pt');
+      half[k.side || 'l'].appendChild(b);
+    }
+    kbd.append(half.l, half.r);
+    return;
+  }
+  for (const row of ROWS) {
+    const r = document.createElement('div'); r.className = 'krow';
+    for (const k of row) {
+      const b = makeKey(k);
+      b.style.flexGrow = k.w;
+      r.appendChild(b);
+    }
+    kbd.appendChild(r);
+  }
+}
+buildKbd();
+layout();
+
+// ======================= mouse =======================
+// No text selection from a drag or a long press: a gesture on the screen, the trackpad or the keys must
+// not start one (phones do, despite user-select). Only fields and the receive code may be selected.
+const selectable = (n) => n && n.closest && n.closest('input, textarea, .recv-url, .recv-code, .log-box pre');
+document.addEventListener('selectstart', (e) => {
+  if (!selectable(e.target.nodeType === 1 ? e.target : e.target.parentElement)) e.preventDefault();
+});
+function clearSelection() { const s = window.getSelection && window.getSelection(); if (s && s.rangeCount) s.removeAllRanges(); }
+
+// The screen is a touch screen by default (Files > More > Touch on the screen): the pointer goes
+// where the finger is (web_pointer, in Mac pixels), a finger held there presses the button, so a
+// tap clicks and a touch that moves drags; a real mouse there moves the Mac's pointer as it hovers.
+// Otherwise the screen, and the trackpad 🖱 puts in the keyboard's place (always), are touchpads:
+// a finger's moves are sent relative (web_mouse), a quick tap is a click, a tap followed by a touch
+// that moves drags; with a real mouse a click on the screen locks the pointer (Esc unlocks). The
+// Click button below holds the button for drags, and a pinch on the screen zooms. The Mac has one
+// button. A finger's move counts in the picture's own pixels (at least 640 across).
+let btnHeld = 0, btnTap = 0;
+function sendMouse(dx, dy) { if (M) M._web_mouse(dx, dy, btnHeld | btnTap | absBtn); }
+
+// ---- touch screen mode
+let touchAbs = localStorage.getItem('picomac-mouse') !== 'pad';
+function setTouchAbs(on) {
+  touchAbs = on;
+  try { localStorage.setItem('picomac-mouse', on ? 'touch' : 'pad'); } catch (_) {}
+  if (on && document.pointerLockElement === wrap) document.exitPointerLock();
+  wrap.classList.toggle('abs', on);
+}
+wrap.classList.toggle('abs', touchAbs);
+let absBtn = 0, absPos = null, absHold = 0, absGen = 0, absPressAt = 0, absSnap = false, absDead = false;
+let absLast = { x: -99, y: -99, t: 0 };   // the last tap, for double clicks on one spot
+let mouseBtn = 0;                         // a real mouse's button over the screen
+// a point on the page -> Mac pixels in the picture (zoom included); null off the picture
+function macXY(cx, cy) {
+  const r = pcCanvas.getBoundingClientRect();
+  if (!pcImg || !r.width || !r.height) return null;
+  const w = pcImg.width, h = pcImg.height;
+  return {
+    x: Math.min(w - 1, Math.max(0, Math.floor((zu + (cx - r.left) / r.width / zoom) * w))),
+    y: Math.min(h - 1, Math.max(0, Math.floor((zv + (cy - r.top) / r.height / zoom) * h))),
+  };
+}
+function sendAbs(pos, extra = 0) { if (M && pos) M._web_pointer(pos.x, pos.y, absBtn | btnHeld | btnTap | extra); }
+function absDown(e) {
+  let pos = macXY(e.clientX, e.clientY);
+  if (!pos) return;
+  const now = performance.now();
+  // a second tap close to the first lands on the first's spot, so the Mac sees a double click
+  absSnap = now - absLast.t < tapGap && Math.abs(pos.x - absLast.x) <= 8 && Math.abs(pos.y - absLast.y) <= 8;
+  if (absSnap) pos = { x: absLast.x, y: absLast.y };
+  absPos = pos; absBtn = 0; absDead = false;
+  const gen = ++absGen;
+  sendAbs(pos);
+  clearTimeout(absHold);
+  // the button goes down a moment later, once it is sure no second finger (a pinch) follows
+  absHold = setTimeout(() => {
+    if (gen !== absGen || absDead) return;
+    absBtn = 1; absPressAt = performance.now(); sendAbs(absPos);
+  }, 60);
+}
+function absMove(e, p, still) {
+  if (absDead || (absSnap && p.moved < still)) return;
+  const pos = macXY(e.clientX, e.clientY);
+  if (pos) { absPos = pos; sendAbs(pos); }
+}
+// the press lasts at least 70 ms (a few Mac frames), or the Mac might never see it
+function absRelease() {
+  const gen = absGen, pos = absPos;
+  const wait = Math.max(0, 70 - (performance.now() - absPressAt));
+  setTimeout(() => { if (gen === absGen) { absBtn = 0; sendAbs(pos); } }, wait);
+}
+function absUp() {
+  clearTimeout(absHold);
+  if (absDead || !absPos) { absDead = false; return; }
+  if (!absBtn) { absBtn = 1; absPressAt = performance.now(); sendAbs(absPos); }   // lifted before the hold: a click
+  absLast = { x: absPos.x, y: absPos.y, t: performance.now() };
+  absRelease();
+}
+// a second finger: no click from the first, and a held button is let go
+function absCancel() {
+  clearTimeout(absHold);
+  if (absDead) return;
+  absDead = true; absLast.t = 0;
+  if (absBtn) { absBtn = 0; sendAbs(absPos); }
+}
+function absMouse(e, ev) {
+  if (!M || uiMode !== 'pc' || !M._web_pc_running()) return;
+  const pos = macXY(e.clientX, e.clientY);
+  if (ev === 'down' && e.button === 0) { mouseBtn = 1; try { wrap.setPointerCapture(e.pointerId); } catch (_) {} }
+  else if (ev === 'up' && e.button === 0) mouseBtn = 0;
+  if (pos) sendAbs(pos, mouseBtn);
+}
+function setButtons(b) { btnHeld = b; sendMouse(0, 0); document.querySelectorAll('.mb').forEach((x) => x.classList.toggle('on', !!(b & +x.dataset.mb))); }
+function click(bit) {
+  btnTap |= bit; sendMouse(0, 0);
+  setTimeout(() => { btnTap &= ~bit; sendMouse(0, 0); }, 90);
+}
+
+let fracX = 0, fracY = 0;
+// A finger's move in CSS pixels -> guest pixels: across the screen's width is across the picture.
+function touchMove(dxCss, dyCss) {
+  const w = pcCanvas.getBoundingClientRect().width || wrap.getBoundingClientRect().width || 320;
+  // guest pixels, not the canvas's device pixels; zoomed in, a finger's move covers less of the picture
+  const k = Math.max(640, pcImg ? pcImg.width : 640) / w / zoom;
+  fracX += dxCss * k; fracY += dyCss * k;
+  const ix = Math.trunc(fracX), iy = Math.trunc(fracY);
+  if (ix || iy) { fracX -= ix; fracY -= iy; sendMouse(ix, iy); }
+}
+// Touch gestures on el (the screen, and the trackpad 🖱 shows in the keyboard's place): a finger
+// moves the pointer, a tap is a left click, a two-finger tap a right click, and a tap followed at
+// once by a touch that moves drags with the left button held (as laptop trackpads do).
+// mouseToo: a real mouse dragging on el acts as a finger (the trackpad; the screen locks instead).
+// zoomable: two fingers that spread, close or move together zoom and pan the PC's picture instead
+// (back to the whole picture below 1.03x); they move no pointer and click nothing.
+// The longest gap between a tap and the next touch for a double tap (and a tap-and-drag), in ms: Files >
+// More > Double tap. Too short and a double tap is hard to make; too long and two taps meant apart become one.
+const TAP_GAPS = [200, 250, 300, 350, 400, 450, 500];
+let tapGap = +(localStorage.getItem('picomac-tapgap') || 300);
+if (!TAP_GAPS.includes(tapGap)) tapGap = 300;
+function stepTapGap(d) {
+  tapGap = TAP_GAPS[Math.min(TAP_GAPS.length - 1, Math.max(0, TAP_GAPS.indexOf(tapGap) + d))];
+  try { localStorage.setItem('picomac-tapgap', String(tapGap)); } catch (_) {}
+}
+// Two more ways to drag, as on a laptop's trackpad: a finger held still for HOLD_MS presses the button
+// (then moving it drags, lifting it lets go), and on the trackpad 🖱 a finger resting while another
+// moves holds the button (the resting finger is the thumb on a trackpad's button; lifting it lets go).
+function bindTouchpad(el, mouseToo, zoomable) {
+  const touches = new Map();          // pointerId -> { x, y, t, moved }
+  let multi = false, lastTap = 0, drag = false;
+  const TAP_LEN = 300, STILL = 9;   // ms a tap may last, px a tap may slip (the gap between taps: tapGap)
+  const HOLD_MS = 450;
+  let holdT = 0, held = false;        // the hold timer / the button went down from a hold
+  let steer = null, rest = null;      // two fingers on the trackpad: the moving one / the resting one
+  const buzz = () => { try { navigator.vibrate && navigator.vibrate(12); } catch (_) {} };
+  let pinch = null, gesture = false;  // two fingers down / they zoomed or panned since the first went down
+  const abs = () => zoomable && touchAbs;   // the screen as a touch screen
+  // the screen while the trackpad shows: the trackpad is the mouse, so a touch here only zooms (two
+  // fingers) and moves the zoomed view (one finger or two); it clicks nothing and moves no pointer
+  const viewOnly = () => zoomable && !$('#pad').hidden;
+  let view = null;                    // one finger panning the zoomed view: where it and the view started
+  const twoOf = () => {
+    const [p, q] = [...touches.values()], r = pcCanvas.getBoundingClientRect();
+    return { d: Math.hypot(p.x - q.x, p.y - q.y), mx: ((p.x + q.x) / 2 - r.left) / r.width,
+      my: ((p.y + q.y) / 2 - r.top) / r.height, r };
+  };
+  el.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (!M || uiMode !== 'pc' || !M._web_pc_running()) return;
+    if (e.pointerType === 'mouse' && !mouseToo) {
+      if (abs()) { absMouse(e, 'down'); return; }
+      if (document.pointerLockElement !== wrap) { wrap.requestPointerLock && wrap.requestPointerLock(); return; }
+      return;                         // locked: the window's mouse events below take it
+    }
+    try { el.setPointerCapture(e.pointerId); } catch (_) {}
+    clearSelection();
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY, t: performance.now(), moved: 0, hx: 0, hy: 0 });
+    clearTimeout(holdT);
+    if (viewOnly()) {
+      view = null; pinch = null;
+      if (touches.size === 1) view = { id: e.pointerId, x: e.clientX, y: e.clientY, u: zu, v: zv };
+      else if (touches.size === 2 && screenKind === 'pc') {
+        const g = twoOf();
+        pinch = { d0: g.d, mx0: g.mx, my0: g.my, s0: zoom, a: zu + g.mx / zoom, b: zv + g.my / zoom };
+      }
+      el.classList.add('touch');
+      return;
+    }
+    if (touches.size > 1) {
+      multi = true;
+      if (abs()) absCancel();
+      if (zoomable && touches.size === 2 && screenKind === 'pc') {
+        const g = twoOf();
+        pinch = { d0: g.d, mx0: g.mx, my0: g.my, s0: zoom, a: zu + g.mx / zoom, b: zv + g.my / zoom };
+      }
+    } else if (abs()) absDown(e);
+    else if (performance.now() - lastTap < tapGap) { drag = true; setButtons(btnHeld | 1); }
+    else {
+      const id = e.pointerId;
+      holdT = setTimeout(() => {
+        const p = touches.get(id);
+        if (!p || touches.size !== 1 || drag || p.moved >= STILL) return;
+        drag = held = true; setButtons(btnHeld | 1); buzz();
+      }, HOLD_MS);
+    }
+    el.classList.add('touch');
+  });
+  el.addEventListener('pointermove', (e) => {
+    if (e.pointerType === 'mouse' && !mouseToo) { if (abs()) absMouse(e, 'move'); return; }
+    const p = touches.get(e.pointerId);
+    if (!p) return;
+    let dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY; p.moved += Math.abs(dx) + Math.abs(dy);
+    if (pinch && touches.size === 2) {
+      const g = twoOf();
+      if (!gesture && Math.abs(g.d - pinch.d0) < 14 &&
+          Math.hypot((g.mx - pinch.mx0) * g.r.width, (g.my - pinch.my0) * g.r.height) < 14) return;
+      gesture = true;
+      zoom = Math.min(8, Math.max(1, pinch.s0 * g.d / Math.max(1, pinch.d0)));
+      if (zoom < 1.03) zoom = 1;
+      // the picture's point that was under the fingers' midpoint stays under it
+      zu = Math.min(1 - 1 / zoom, Math.max(0, pinch.a - g.mx / zoom));
+      zv = Math.min(1 - 1 / zoom, Math.max(0, pinch.b - g.my / zoom));
+      drawPc();
+      return;
+    }
+    if (gesture) return;              // a finger left over from a pinch moves nothing
+    if (viewOnly()) {
+      if (view && view.id === e.pointerId && touches.size === 1 && zoom > 1) {
+        const r = pcCanvas.getBoundingClientRect();
+        if (!r.width || !r.height) return;
+        zu = Math.min(1 - 1 / zoom, Math.max(0, view.u - (e.clientX - view.x) / r.width / zoom));
+        zv = Math.min(1 - 1 / zoom, Math.max(0, view.v - (e.clientY - view.y) / r.height / zoom));
+        drawPc();
+      }
+      return;
+    }
+    if (p.moved >= STILL) clearTimeout(holdT);
+    if (!abs() && !pinch && touches.size === 2) {
+      // the trackpad's two fingers: the first to move steers; if the other rests, the button is held
+      if (steer === null) {
+        if (p.moved < STILL) return;
+        steer = e.pointerId;
+        for (const [id, q] of touches) if (id !== steer && q.moved < STILL) rest = id;
+        if (rest !== null && !drag) { drag = true; setButtons(btnHeld | 1); buzz(); }
+      }
+      if (e.pointerId !== steer) return;
+      if (p.hx || p.hy) { dx += p.hx; dy += p.hy; p.hx = p.hy = 0; }
+      touchMove(dx, dy);
+      return;
+    }
+    // otherwise only the first finger steers (or the one left after a two-finger drag)
+    if (touches.keys().next().value !== e.pointerId) return;
+    if (abs()) { absMove(e, p, STILL); return; }
+    // A finger that has barely moved may still be a tap: its slip is held back, so the two clicks of
+    // a double tap land on the same spot (Windows wants them within 4 px), and sent once it moves on.
+    if (p.moved < STILL) { p.hx += dx; p.hy += dy; return; }
+    if (p.hx || p.hy) { dx += p.hx; dy += p.hy; p.hx = p.hy = 0; }
+    touchMove(dx, dy);
+  });
+  for (const ev of ['pointerup', 'pointercancel']) el.addEventListener(ev, (e) => {
+    if (e.pointerType === 'mouse' && !mouseToo) { if (abs()) absMouse(e, 'up'); return; }
+    const p = touches.get(e.pointerId);
+    if (!p) return;
+    touches.delete(e.pointerId);
+    pinch = null;
+    clearTimeout(holdT);
+    if (view || viewOnly()) {         // the view's touches: nothing to let go, no click
+      view = null;
+      if (touches.size === 0) { el.classList.remove('touch'); gesture = false; multi = false; lastTap = 0; }
+      return;
+    }
+    if (e.pointerId === steer) steer = null;           // the resting finger keeps the button down
+    if (e.pointerId === rest) {                        // the "thumb" lifts: the button goes up
+      rest = null;
+      if (drag) { drag = false; setButtons(btnHeld & ~1); }
+    }
+    const tap = ev === 'pointerup' && performance.now() - p.t < TAP_LEN && p.moved < STILL && !held;
+    if (touches.size === 0) {
+      el.classList.remove('touch');
+      steer = rest = null;
+      if (held) {                     // a held press: let go, no click, no double tap after it
+        held = false; lastTap = 0; multi = false;
+        if (drag) { drag = false; setButtons(btnHeld & ~1); }
+        return;
+      }
+      if (abs()) {
+        const cancelled = gesture || multi || ev !== 'pointerup';   // a pinch or two fingers: no click
+        gesture = false; multi = false;
+        if (cancelled) { absCancel(); absDead = false; } else absUp();
+        return;
+      }
+      if (gesture) {                  // a pinch: no click
+        gesture = false; lastTap = 0;
+        if (drag) { drag = false; setButtons(btnHeld & ~1); }
+      } else if (drag) {                     // the end of a drag; a quick second tap was the double click's second
+        drag = false; setButtons(btnHeld & ~1);   // its press went at the touch, its release goes now
+        lastTap = 0;
+      } else if (tap && !multi) {   // one button: a two-finger tap clicks nothing
+        click(1);
+        lastTap = multi ? 0 : performance.now();
+      } else lastTap = 0;
+      multi = false;
+    }
+  });
+  el.addEventListener('contextmenu', (e) => e.preventDefault());
+}
+bindTouchpad(wrap, false, true);
+bindTouchpad($('#pad'), true, false);
+// iOS still shows its loupe and starts a selection on a long press or a drag despite user-select and
+// touch-callout; only a non-passive touch listener that cancels the touch stops it. The pointer events
+// these areas use still arrive (they come before the touch's default action), but no click does: none
+// of them uses one.
+for (const el of [wrap, $('#pad'), $('#kbd'), ...document.querySelectorAll('.mb')]) {
+  for (const ev of ['touchstart', 'touchmove']) el.addEventListener(ev, (e) => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+}
+document.addEventListener('touchend', clearSelection, { passive: true });
+
+document.addEventListener('pointerlockchange', () => wrap.classList.toggle('locked', document.pointerLockElement === wrap));
+document.addEventListener('mousemove', (e) => {
+  if (document.pointerLockElement === wrap) sendMouse(e.movementX, e.movementY);
+});
+document.addEventListener('mousedown', (e) => {
+  if (document.pointerLockElement !== wrap) return;
+  if (e.button === 0) setButtons(btnHeld | 1);
+});
+document.addEventListener('mouseup', (e) => {
+  if (document.pointerLockElement !== wrap) return;
+  if (e.button === 0) setButtons(btnHeld & ~1);
+});
+
+document.querySelectorAll('.mb').forEach((b) => {
+  const bit = +b.dataset.mb;
+  b.addEventListener('pointerdown', (e) => { e.preventDefault(); try { b.setPointerCapture(e.pointerId); } catch (_) {} setButtons(btnHeld | bit); });
+  for (const ev of ['pointerup', 'pointercancel']) b.addEventListener(ev, () => setButtons(btnHeld & ~bit));
+  b.addEventListener('contextmenu', (e) => e.preventDefault());
+});
+
+// (the touchpad's buttons show only while a PC runs: setMode)
+
+// ======================= toolbar =======================
+$('#toolbar').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  startAudio();
+  switch (b.dataset.act) {
+    case 'menu': tapKey(K.ESC, [K.CTRL]); break;             // the in-game menu (a no-op in the home menu)
+    case 'kbd': if (padOn || gameOn) { padOn = gameOn = false; kbdOn = true; } else kbdOn = !kbdOn; layout(); break;
+    case 'game': gameOn = !(gameOn && kbdOn && !padOn); padOn = false; kbdOn = true; layout(); break;
+    case 'files': openFiles(); break;
+    case 'mouse': padOn = !padOn; if (padOn) gameOn = false; else kbdOn = true; layout(); break;   // the trackpad instead of the keyboard
+    case 'sound': toggleMute(); break;
+  }
+});
+
+// ======================= audio =======================
+let actx = null, gain = null, muted = false;
+function startAudio() {
+  // iOS: play through the ring/silent switch like a media app (Safari 16.4+)
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+  if (actx) { if (actx.state !== 'running') actx.resume(); return; }
+  if (!M) return;
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+    actx.resume();                                          // still inside the user gesture
+    // a silent one-sample buffer, started in the gesture, unlocks older iOS WebKit
+    const sb = actx.createBuffer(1, 1, 22050), src = actx.createBufferSource();
+    src.buffer = sb; src.connect(actx.destination); src.start(0);
+  } catch (e) { console.warn('audio', e); return; }
+  actx.audioWorklet.addModule('audio-worklet.js').then(() => {
+    const node = new AudioWorkletNode(actx, 'picomac-ring', { numberOfInputs: 0, outputChannelCount: [1] });
+    node.port.postMessage({ buf: M.HEAPU8.buffer, ptr: M._web_audio_ring() });
+    gain = actx.createGain(); gain.gain.value = muted ? 0 : 1;
+    node.connect(gain).connect(actx.destination);
+  }).catch((e) => console.warn('audio worklet', e));
+}
+function toggleMute() {
+  muted = !muted;
+  if (gain) gain.gain.value = muted ? 0 : 1;
+  $('[data-act=sound]').textContent = muted ? '🔇' : '🔊';
+}
+for (const ev of ['pointerdown', 'touchend', 'keydown']) document.addEventListener(ev, () => { if (M) startAudio(); }, true);
+
+// ======================= files =======================
+// The Files screen: the home menu's first row (hal_web_files), the toolbar's 📁 and the menus' 📁.
+// It is drawn like the emulator's menus (#ui's cards): the top level has Upload, Receive from a PC,
+// the folders, the language and Restart; a folder lists its files with Download and Delete.
+// Closing it tells the home menu (web_files_closed), which then lists the startups again.
+let filesDir = null;                   // null: the top level; else one of FOLDERS
+let upTarget = null;                   // where the next upload goes; null: by its extension
+let upStatus = '';
+const filesEl = $('#files'), filesBody = $('#files-body');
+
+// a folder's own files: the dot files (.unzipped, temporaries) are the emulator's
+const filesIn = async (f) => (await fsList('/sdcard/' + f)).filter((it) => !it.dir && !it.name.startsWith('.'))
+  .sort((a, b) => a.name.localeCompare(b.name));
+let filesGen = 0;   // a newer renderFiles wins over one still waiting for its lists
+const folderName = (f) => f.replace(/^picomac\/?/, '') || 'picomac';
+function fmtSize(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? Math.round(n / 1024) + ' KB' : n + ' B'; }
+const FILE_ICON = { dsk: '💾', img: '💾', image: '💾', hfv: '💾', hfs: '💾', dc42: '💾', diskcopy: '💾', iso: '💿',
+  rom: '🧩', bin: '🧩', cfg: '⚙️', snp: '📸', hqx: '📦', sit: '📦', zip: '📦' };
+
+// one card in the menus' style: icon, label, small line, then a value and chevron, or buttons
+function fRow(o) {
+  const b = el('div', 'ui-row' + (o.click ? '' : ' static'));
+  if (o.click) { b.setAttribute('role', 'button'); b.addEventListener('click', o.click); }
+  if (o.ico) b.append(el('div', 'ui-ico', o.ico));
+  const tx = el('div', 'ui-txt');
+  tx.append(el('b', null, o.label));
+  if (o.sub) { const sm = el('small', null, o.sub); if (o.subId) sm.id = o.subId; tx.append(sm); }
+  b.append(tx);
+  if (o.acts) {
+    const a = el('div', 'ui-adj');
+    for (const [txt, title, fn] of o.acts) {
+      const x = el('button', null, txt); x.title = title;
+      x.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+      a.append(x);
+    }
+    b.append(a);
+  } else if (o.click) {
+    if (o.val) b.append(el('span', 'ui-val', o.val));
+    b.append(el('span', 'ui-chev', '›'));
+  }
+  return b;
+}
+
+async function renderFiles() {
+  if (filesEl.hidden || !fsMod) return;
+  const gen = ++filesGen, lists = {};
+  for (const f of filesDir === null ? FOLDERS : [filesDir]) lists[f] = await filesIn(f);
+  if (gen !== filesGen || filesEl.hidden) return;
+  const keep = filesBody.scrollTop;
+  filesBody.innerHTML = '';
+  const w = el('div', 'ui-wrap');
+  filesBody.append(w);
+  if (filesDir === null) {
+    $('#files-title').textContent = t('files.title');
+    $('#files-sub').textContent = t('files.sub');
+    w.append(fRow({ ico: '⬆️', label: t('files.upload'), sub: upStatus || t('files.uploadSub'), subId: 'up-status',
+      click: () => { upTarget = null; $('#upload').click(); } }));
+    if (!recv) {
+      w.append(fRow({ ico: '💻', label: t('recv.start'), sub: t('recv.sub'), click: () => { recvStart(); renderFiles(); } }));
+    } else {
+      // receiving: the code for the PC's /send page, the progress and Stop
+      const c = el('div', 'ui-row static recv-card');
+      const tx = el('div', 'ui-txt');
+      tx.append(el('b', null, t('recv.start')));
+      const how = el('small', 'wrap'); how.innerHTML = t('recv.how'); tx.append(how);
+      const st = el('small', 'wrap', recv.status || ''); st.id = 'recv-status';
+      tx.append(el('div', 'recv-url', location.origin + '/send?c=' + recv.code), el('div', 'recv-code', recv.code), st);
+      const a = el('div', 'ui-adj');
+      const stop = el('button', 'wide', t('recv.stop'));
+      stop.addEventListener('click', () => { recvStop(); renderFiles(); });
+      a.append(stop);
+      c.append(el('div', 'ui-ico', '💻'), tx, a);
+      w.append(c);
+    }
+    w.append(el('div', 'ui-sec', t('files.folders')));
+    for (const f of FOLDERS) {
+      const items = lists[f];
+      const total = items.reduce((n, it) => n + it.size, 0);
+      w.append(fRow({ ico: '📂', label: folderName(f), sub: f + '/',
+        val: items.length ? t('files.count', items.length, fmtSize(total)) : t('files.empty'),
+        click: () => { filesDir = f; upStatus = ''; filesBody.scrollTop = 0; renderFiles(); } }));
+    }
+    w.append(el('div', 'ui-sec', t('files.more')));
+    const langs = Object.keys(I18N);
+    const stepLang = (d) => setLang(langs[(langs.indexOf(LANG) + d + langs.length) % langs.length]);
+    w.append(fRow({ ico: '🌐', label: t('files.lang'), sub: I18N[LANG]._name,
+      acts: [['◀', t('files.lang'), () => stepLang(-1)], ['▶', t('files.lang'), () => stepLang(1)]] }));
+    w.append(fRow({ ico: '🖐️', label: t('files.mouse'), sub: t(touchAbs ? 'files.mouseTouch' : 'files.mousePad'),
+      val: touchAbs ? '✓' : '—', click: () => { setTouchAbs(!touchAbs); renderFiles(); } }));
+    w.append(fRow({ ico: '👆', label: t('files.tapgap'), sub: t('files.tapgapSub', tapGap),
+      acts: [['◀', t('files.tapgap'), () => { stepTapGap(-1); renderFiles(); }],
+             ['▶', t('files.tapgap'), () => { stepTapGap(1); renderFiles(); }]] }));
+    w.append(fRow({ ico: '📜', label: t('files.log'), sub: t('files.logSub'), click: showLog }));
+    w.append(fRow({ ico: '🔄', label: t('files.reboot'), sub: t('files.rebootSub'),
+      click: () => { if (confirm(t('confirm.reboot'))) M.webReboot(); } }));
+    const hint = el('p', 'ui-note'); hint.innerHTML = t('files.hint'); w.append(hint);
+  } else {
+    const dir = '/sdcard/' + filesDir;
+    const items = lists[filesDir];
+    $('#files-title').textContent = folderName(filesDir);
+    $('#files-sub').textContent = filesDir + '/';
+    w.append(fRow({ ico: '⬆️', label: t('files.uploadHere'), sub: upStatus || t('files.uploadHereSub'), subId: 'up-status',
+      click: () => { upTarget = filesDir; $('#upload').click(); } }));
+    if (!items.length) w.append(fRow({ ico: '·', label: t('files.empty') }));
+    for (const it of items) {
+      const ext = ((it.name.match(/\.([^.]+)$/) || [])[1] || '').toLowerCase();
+      w.append(fRow({ ico: FILE_ICON[ext] || '📄', label: it.name, sub: fmtSize(it.size), acts: [
+        // a disk the guest wrote to can be taken home again
+        ['⬇️', t('files.download'), () => {
+          const a = document.createElement('a');
+          fileBlob(dir + '/' + it.name).then((b) => {
+            a.href = URL.createObjectURL(b);
+            a.download = it.name; a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+          }).catch((e) => alert(String(e)));
+        }],
+        ['🗑️', t('files.delete'), () => {
+          if (!confirm(t('files.confirmDelete', it.name))) return;
+          fsUnlink(dir + '/' + it.name).then((r) => {
+            if (r < 0) alert(t('files.deleteFail', 'error ' + -r));
+            renderFiles();
+          });
+        }],
+      ] }));
+    }
+  }
+  filesBody.scrollTop = keep;
+}
+const refreshFiles = renderFiles;
+function setUpStatus(txt) { upStatus = txt; const e = $('#up-status'); if (e) e.textContent = txt; }
+
+function openFiles(dir = null) {
+  releaseAll();
+  filesDir = dir; upStatus = '';
+  filesEl.hidden = false; filesBody.scrollTop = 0;
+  renderFiles();
+}
+function closeFiles() {
+  if (filesDir !== null) { filesDir = null; upStatus = ''; renderFiles(); return; }   // a folder: back to the top
+  filesEl.hidden = true;
+  recvStop();
+  if (M) M._web_files_closed();   // the home menu waits in hal_web_files
+}
+$('#files-back').addEventListener('click', closeFiles);
+// Big files (disk images up to MAX_FILE) go into the FS a piece at a time: the file is sized once
+// (truncate makes MEMFS allocate exactly that, with no regrowing copies), then each piece is
+// written at its place. A whole 512 MB file read at once, and copied by writeFile, would need
+// twice its size, more than a phone gives a tab.
+const MAX_FILE = 512 * 1024 * 1024;
+// A download. On OPFS the browser's own File for it, which stays on disk; otherwise read a piece at a
+// time (readFile would want the whole file in the wasm heap).
+async function fileBlob(path) {
+  if (cardOpfs && path.startsWith('/sdcard/')) {
+    try {
+      const parts = path.slice(8).split('/'), name = parts.pop();
+      let d = await navigator.storage.getDirectory();
+      for (const p of parts) d = await d.getDirectoryHandle(p);
+      return await (await d.getFileHandle(name)).getFile();
+    } catch (e) { console.warn('opfs file', e); }
+  }
+  const size = await fsStat(path);
+  if (size < 0) throw new Error(path);
+  const fd = await fsOpenR(path), parts = [];
+  try {
+    for (let off = 0; off < size; off += PIECE) parts.push(await fsPread(fd, Math.min(PIECE, size - off), off));
+  } finally { await fsClose(fd); }
+  return new Blob(parts);
+}
+async function writeUpload(path, f, onPct) {
+  if (f.size > MAX_FILE) throw new Error(t('send.tooBig'));
+  const fd = await fsOpenW(path, f.size);
+  try {
+    for (let off = 0; off < f.size; off += PIECE) {
+      const b = new Uint8Array(await f.slice(off, off + PIECE).arrayBuffer());
+      await fsPwrite(fd, b, off);
+      onPct(Math.floor(100 * (off + b.length) / Math.max(1, f.size)));
+    }
+  } catch (e) { await fsClose(fd); await fsUnlink(path); throw e; }
+  await fsClose(fd);
+}
+$('#upload').addEventListener('change', async (e) => {
+  const files = [...e.target.files]; e.target.value = '';
+  if (!M || !files.length) return;
+  let n = 0, last = '';
+  for (const f of files) {
+    const folder = upTarget || recvFolder(f.name);
+    setUpStatus(t('files.uploading', f.name));
+    try {
+      await fsMkdirs('/sdcard/' + folder);
+      await writeUpload('/sdcard/' + folder + '/' + f.name, f, (p) => setUpStatus(t('files.uploading', f.name) + ' ' + p + '%'));
+      n++; last = folder;
+    } catch (err) { alert(t('files.uploadFail', f.name, err)); }
+  }
+  upStatus = n ? t('files.saved', n, last) : '';
+  renderFiles();
+});
+
+// ---- receive from PC: the phone opens a relay room (worker/relay.js) under a short code; the
+// desktop page /send joins it and streams files: {"t":"file",name,size,folder} + binary chunks +
+// {"t":"end"}. Each file is written to /sdcard/<folder> and answered with {"t":"saved",path}.
+const EXT_FOLDER = { dsk: 'picomac/disks', img: 'picomac/disks', image: 'picomac/disks', hfv: 'picomac/disks',
+  hfs: 'picomac/disks', dc42: 'picomac/disks', diskcopy: 'picomac/disks', iso: 'picomac/disks',
+  rom: 'picomac/roms', bin: 'picomac/roms' };
+const RECV_IDLE_MS = 10 * 60 * 1000, RECV_MAX = 512 * 1024 * 1024, ACK_EVERY = 1024 * 1024;
+let recv = null;   // { ws, code, idle, chain, cur:{name,size,folder,path,fd,got,acked} }: fd is the file thread's
+
+function recvCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789', r = crypto.getRandomValues(new Uint8Array(5));
+  return [...r].map((b) => A[b % A.length]).join('');
+}
+// kept on recv, so the Files screen shows it again when it is drawn anew
+function recvStatus(k, ...a) {
+  if (!recv) return;
+  recv.status = t(k, ...a);
+  const e = $('#recv-status'); if (e) e.textContent = recv.status;
+}
+function recvTouch() { clearTimeout(recv.idle); recv.idle = setTimeout(recvStop, RECV_IDLE_MS); }
+function recvFolder(name, asked) {
+  if (FOLDERS.includes(asked)) return asked;
+  const ext = (name.match(/\.([^.]+)$/) || [])[1];
+  return EXT_FOLDER[(ext || '').toLowerCase()] || filesDir || 'picomac';
+}
+
+function recvStart() {
+  recvStop();
+  const code = recvCode();
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/api/relay/${code}?role=recv`);
+  ws.binaryType = 'arraybuffer';
+  recv = { ws, code, idle: 0, cur: null, chain: Promise.resolve() };
+  recvStatus('recv.connecting');
+  recvTouch();
+  const reply = (o) => { try { ws.send(JSON.stringify(o)); } catch (e) {} };
+  ws.onopen = () => recvStatus('recv.waiting');
+  ws.onclose = () => { if (recv && recv.ws === ws) { recvStatus('recv.closed'); recv.ws = null; } };
+  ws.onmessage = (e) => {
+    if (!recv || recv.ws !== ws) return;
+    recvTouch();
+    // one message at a time, in order: each waits for the file thread's answer to the one before
+    const R = recv;
+    R.chain = R.chain.then(() => recvMsg(R, e.data, reply)).catch((err) => console.warn('recv', err));
+  };
+}
+async function recvMsg(R, data, reply) {
+  if (recv !== R) return;
+  const c = R.cur;
+  if (typeof data !== 'string') {             // a chunk of the current file
+    const b = new Uint8Array(data);
+    if (c && c.bad) { c.got = (c.got || 0) + b.length; reply({ t: 'ack', got: c.got }); return; }   // keep /send moving to its end, which gets the error
+    if (!c) return;
+    if (c.got + b.length > c.size) { c.bad = 'size'; return; }
+    try { await fsPwrite(c.fd, b, c.got); } catch (err) { c.bad = String(err); return; }
+    c.got += b.length;
+    // acked only once written, so /send never runs more than its WINDOW ahead of the phone's storage
+    if (c.got - c.acked >= ACK_EVERY || c.got === c.size) { c.acked = c.got; reply({ t: 'ack', got: c.got }); }
+    if (recv === R) recvStatus('recv.getting', c.name, Math.floor(100 * c.got / Math.max(1, c.size)));
+    return;
+  }
+  let m; try { m = JSON.parse(data); } catch (err) { return; }
+  if (m.t === 'peer') recvStatus(m.on ? 'recv.pc' : 'recv.waiting');
+  else if (m.t === 'file') {
+    const name = String(m.name || '').replace(/[\/:*?"<>|\x00-\x1f]/g, '_').replace(/^\.+/, '').slice(0, 120);
+    const size = Number(m.size) | 0;
+    if (c && c.fd != null) { R.cur = null; await fsClose(c.fd); await fsUnlink(c.path); }
+    if (!name || size < 0 || size > RECV_MAX) { R.cur = { name: name || '?', bad: 'size' }; return; }
+    // straight into the file as it arrives (sized first), not into a buffer the file's size
+    const folder = recvFolder(name, m.folder), path = '/sdcard/' + folder + '/' + name;
+    try {
+      await fsMkdirs('/sdcard/' + folder);
+      R.cur = { name, size, folder, path, fd: await fsOpenW(path, size), got: 0, acked: 0 };
+      reply({ t: 'ack', got: 0 });   // tells /send this phone acks: it then keeps under its WINDOW in flight
+    } catch (err) { R.cur = { name, bad: String(err) }; reply({ t: 'error', name, msg: String(err) }); return; }
+    recvStatus('recv.getting', name, 0);
+  } else if (m.t === 'end' && c) {
+    R.cur = null;
+    if (c.fd != null) await fsClose(c.fd);
+    if (c.bad || c.got !== c.size) {
+      if (c.fd != null) await fsUnlink(c.path);
+      reply({ t: 'error', name: c.name, msg: t('recv.badFile') }); return;
+    }
+    reply({ t: 'saved', name: c.name, path: c.folder + '/' + c.name });
+    recvStatus('recv.saved', c.name, c.folder);
+    refreshFiles();
+  }
+}
+function recvStop() {
+  if (!recv) return;
+  const R = recv;
+  recv = null;
+  clearTimeout(R.idle);
+  if (R.ws) { R.ws.onclose = null; try { R.ws.close(); } catch (e) {} }
+  // a file cut off halfway is not kept: dropped once the write in progress is done
+  R.chain.then(async () => {
+    const c = R.cur;
+    R.cur = null;
+    if (c && c.fd != null) { await fsClose(c.fd); await fsUnlink(c.path); }
+  });
+}
+// a new language re-labels what JS built, too
+document.addEventListener('picomac-lang', () => { upStatus = ''; renderFiles(); });

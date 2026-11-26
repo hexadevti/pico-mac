@@ -30,6 +30,7 @@
 #include "../frontend/browser.h"
 #include "../../core.h"
 #include "mac_snapshot.h"
+#include "mac_drives.h"
 
 extern "C" {
 #include "umac/umac.h"
@@ -275,6 +276,21 @@ void drawJob(void *) {
   if (s_screenLive == SCREEN_PAN) followPointer(visH);
   if (!s_redraw && !s_wholeLeft && px == s_panX && py == s_panY && !memcmp(fb, s_prevFb, s_fbBytes)) return;
   memcpy(s_prevFb, fb, s_fbBytes);
+#if defined(EMU_WEB)
+  // The page shows the Mac's own 512x342 picture; the panel is never seen while it runs.
+  {
+    static uint16_t *pic = nullptr;
+    if (!pic) pic = (uint16_t *)hal_alloc_big(1024 * 1024 * 2);
+    const int n = umac_disp_w * umac_disp_h;
+    if (pic && n <= 1024 * 1024) {
+      for (int i = 0; i < n; i++) pic[i] = (s_prevFb[i >> 3] & (0x80 >> (i & 7))) ? 0x0000 : 0xFFFF;
+      hal_web_pc_frame(pic, umac_disp_w, umac_disp_h, umac_disp_w);
+    }
+    s_redraw = false;
+    s_wholeLeft = 0;
+    return;
+  }
+#endif
   // A whole picture goes to both buffers in turn: the in-game menu shows the front buffer
   // whole as its backdrop, and the Fit bands of a buffer that only got partial frames still held
   // whatever was there before the boot.
@@ -311,6 +327,9 @@ void drawJob(void *) {
 
 // A line of text in the bottom strip for 2 s; null clears the strip.
 void showNote(const char *text) {
+#if defined(EMU_WEB)
+  hal_web_status(0, text);
+#endif
   const int y = PANEL_H - kStripH;
   ui::fill(0, y, PANEL_W, kStripH, 0);
   if (text) ui::text(PANEL_W / 2, y + 5, text, ui::kAccent, 1, ui::MC);
@@ -530,6 +549,42 @@ void moveMouse() {
   s_ram[0x8CE] = s_ram[0x8CF];
 }
 
+#if defined(EMU_WEB)
+// The page's pointer (hal_web_mouse): a touched spot (absolute) or the touchpad's moves, set
+// through the same globals as moveMouse, and its button. A press or release that comes with a
+// move waits one frame, so the click lands where the finger went, not where the pointer was.
+void webPointer() {
+  int dx, dy, x, y, b;
+  if (!hal_web_mouse(&dx, &dy, &x, &y, &b)) return;
+  const bool moved = dx || dy || x >= 0;
+  if (moved) {
+    const int top = (int16_t)rd16(0x834), left = (int16_t)rd16(0x836);       // CrsrPin
+    const int bottom = (int16_t)rd16(0x838), right = (int16_t)rd16(0x83A);
+    if (bottom <= top || right <= left || bottom > 1024 || right > 1024) {   // not set up yet
+      if (dx || dy) umac_mouse(dx, -dy, s_button);
+    } else {
+      const uint32_t base = s_ram[0x8CE] ? 0x828 : 0x830;
+      int v = x >= 0 ? y : (int16_t)rd16(base) + dy, h = x >= 0 ? x : (int16_t)rd16(base + 2) + dx;
+      if (v < top) v = top;
+      if (v > bottom - 1) v = bottom - 1;
+      if (h < left) h = left;
+      if (h > right - 1) h = right - 1;
+      wr16(0x828, v); wr16(0x82A, h);
+      wr16(0x82C, v); wr16(0x82E, h);
+      s_ram[0x8CE] = s_ram[0x8CF];
+    }
+  }
+  static int sent = 0;
+  static bool waited = false;
+  if (b == sent) return;
+  if (moved && !waited) { waited = true; return; }
+  waited = false;
+  sent = b;
+  s_button = b != 0;
+  umac_mouse(0, 0, s_button);
+}
+#endif
+
 // --- power --------------------------------------------------------------------------------------
 int16_t s_mix[UMAC_SND_SAMPLES];
 int s_sndStart = 0;                 // where the driver's ring starts (see app_loop)
@@ -558,8 +613,11 @@ struct SoundFilter {
 static SoundFilter s_soundFilter;
 uint32_t s_secFrac = 0;             // 1 Hz interrupt: 60.15 frames a second, in 1/1000 frames
 uint32_t s_frames = 0;
-uint32_t s_speedT0 = 0, s_speedF0 = 0;
-char s_speed[48];
+// The speed setting, 1x-4x (a startup's Max, for the Mac II, is 4x here).
+int plusSpeed() { return g_settings.speed < 1 ? 1 : g_settings.speed > 4 ? 4 : g_settings.speed; }
+
+uint32_t s_speedT0 = 0, s_speedF0 = 0, s_speedW0 = 0;
+char s_speed[64];
 uint32_t s_underrunsShown = 0;
 uint32_t s_lastFrameMs = 0;
 
@@ -605,7 +663,7 @@ bool powerOn() {
     describeDisk(s_disks[i], discs[i]);
   }
   umac_init(s_ram, s_rom, s_ramSize, discs);
-  umac_set_speed(g_settings.speed);
+  umac_set_speed(plusSpeed());
   loadPram();
   s_redraw = true;
   s_panX = s_panY = 0;
@@ -615,6 +673,16 @@ bool powerOn() {
 // --- snapshots (mac_snapshot.cpp) ---------------------------------------------------------------
 // Saved and loaded once the menu has closed (mac_runFrame), as pico-386 does.
 std::string s_snapSave, s_snapReplace, s_snapLoad;  // the save's name, the snapshot it overwrites
+
+int snapWrite(void *ctx, void *p, unsigned n) { return fwrite(p, 1, n, (FILE *)ctx) == n ? 0 : 1; }
+int snapRead(void *ctx, void *p, unsigned n) { return fread(p, 1, n, (FILE *)ctx) == n ? 0 : 1; }
+bool saveState(FILE *f) { return umac_save_state(snapWrite, f) == 0; }
+int loadState(FILE *f) { return umac_load_state(snapRead, f); }
+// The screen for the snapshot's picture: 1 bit a pixel, set = black.
+uint32_t screenPixel(int x, int y) {
+  const int i = y * umac_disp_w + x;
+  return (s_ram[umac_get_fb_offset() + (i >> 3)] & (0x80 >> (i & 7))) ? 0 : 0xFFFFFF;
+}
 
 void saveSnapshot() {
   hal_job_wait();
@@ -626,7 +694,7 @@ void saveSnapshot() {
   m.rom = g_settings.romPath;
   for (int i = 0; i < RAM_COUNT; i++) if (kRamSizes[i] == s_ramSize) m.ram = i;
   m.screen = s_screenLive == SCREEN_NATIVE ? SCREEN_NATIVE : g_settings.screen == SCREEN_NATIVE ? SCREEN_FIT : g_settings.screen;
-  const char *e = macsnap_save(s_snapSave, s_snapReplace, m, s_ram + umac_get_fb_offset(), umac_disp_w, umac_disp_h);
+  const char *e = macsnap_save(s_snapSave, s_snapReplace, m, screenPixel, umac_disp_w, umac_disp_h, saveState);
   // The disks as they are now go with it: their next write is a new generation.
   if (!e) for (Disk &d : s_disks) d.touched = false;
   showNote(e ? e : ("Saved: " + s_snapSave).c_str());
@@ -651,12 +719,12 @@ bool startFromSnapshot(const std::string &snap) {
   releaseAll();
   if (!powerOn()) return false;
   bool broken;
-  if (const char *e = macsnap_restore(snap, &broken)) {
+  if (const char *e = macsnap_restore(snap, &broken, loadState)) {
     ui::message("Snapshot", e, 2500);
     hal_panel_fill(0, 0, PANEL_W, PANEL_H, 0);
     return broken ? powerOn() : true;               // not "broken": nothing was loaded
   }
-  umac_set_speed(g_settings.speed);                 // the speed is the menu's, not the snapshot's
+  umac_set_speed(plusSpeed());                 // the speed is the menu's, not the snapshot's
   // The clock moves on to now when there is one: the RTC and the System's copy (Time, 0x20C).
   uint32_t secs;
   if (hostClock(&secs)) {
@@ -779,6 +847,7 @@ bool mac_loadRom(const char *path) {
   s_frames = s_secFrac = 0;
   s_speedT0 = hal_micros();
   s_speedF0 = 0;
+  s_speedW0 = hal_audio_wait_us();
   s_noteUntil = 0;
   s_stripUsed = g_settings.showFps;
   s_redraw = true;                                  // the whole panel: the menu is still on it
@@ -825,6 +894,10 @@ void mac_runFrame(bool draw) {
   if (ms - s_lastFrameMs > 200) s_redraw = true;
   s_lastFrameMs = ms;
   moveMouse();
+#if defined(EMU_WEB)
+  hal_web_ui_pc();
+  webPointer();
+#endif
   // Sound. The hardware reads one sample of the buffer per scan line, sample 0 at the VBL.
   // The driver refills it from the VBL interrupt as a ring: the ROM's boot beep from sample 0,
   // the Sound Manager from wherever it left off (37 in a PoP trace), and stays ahead of the
@@ -835,7 +908,7 @@ void mac_runFrame(bool draw) {
   // were written, and next frame's P follows this frame's P-1, whatever the speed.
   dbgStep();
   umac_sound_mark_reset();
-  umac_run(kFrameCycles * (uint32_t)g_settings.speed);
+  umac_run(kFrameCycles * (uint32_t)plusSpeed());
   {
     static int fixes = 0;
     if (umac_vbl_fixes() != fixes) {
@@ -891,29 +964,28 @@ void mac_shutdown() {
 const char *mac_fpsText() {
   const uint32_t now = hal_micros(), us = now - s_speedT0;
   if (us) {
-    const uint64_t cyc = (uint64_t)(s_frames - s_speedF0) * kFrameCycles * g_settings.speed;
+    const uint64_t cyc = (uint64_t)(s_frames - s_speedF0) * kFrameCycles * plusSpeed();
     // gaps: sound output buffers that ran dry since the last reading (each one is a click)
     const uint32_t under = hal_audio_underruns();
-    snprintf(s_speed, sizeof s_speed, "%u%% of a Plus  %u gaps", (unsigned)(cyc * 100 * 1000000 / UMAC_CPU_HZ / us),
-             (unsigned)(under - s_underrunsShown));
+    // max: the speed with no waiting for the sound (the headroom, in Plus units, as the Mac II's)
+    const uint32_t wait = hal_audio_wait_us() - s_speedW0, busy = us > wait ? us - wait : 1;
+    const uint64_t maxX10 = cyc * 10 * 1000000 / UMAC_CPU_HZ / busy;
+    snprintf(s_speed, sizeof s_speed, "%u%% of a Plus  max %u.%ux (%u MHz)  %u gaps",
+             (unsigned)(cyc * 100 * 1000000 / UMAC_CPU_HZ / us), (unsigned)(maxX10 / 10), (unsigned)(maxX10 % 10),
+             (unsigned)(cyc * 1000000 / busy / 1000000), (unsigned)(under - s_underrunsShown));
     s_underrunsShown = under;
   }
   s_speedT0 = now;
   s_speedF0 = s_frames;
+  s_speedW0 = hal_audio_wait_us();
   return s_speed;
 }
 
 // --- in-game menu rows ------------------------------------------------------------------------
 // The snapshots first, right below Resume (as pico-386).
-enum { ROW_SNAP_LOAD, ROW_SNAP_SAVE, ROW_SCREEN, ROW_SPEED, ROW_ARROWS, ROW_DISK, ROW_DISK2, ROW_COUNT };
+// Then Drives (a submenu, as pico-386's Disks), then the settings.
+enum { ROW_SNAP_LOAD, ROW_SNAP_SAVE, ROW_DRIVES, ROW_SCREEN, ROW_SPEED, ROW_ARROWS, ROW_COUNT };
 char s_speedName[8];
-std::string s_diskName, s_disk2Name;
-
-std::string baseName(const std::string &path) {
-  if (path.empty()) return "None";
-  const size_t sl = path.find_last_of('/');
-  return path.substr(sl == std::string::npos ? 0 : sl + 1);
-}
 
 // A new boot or second disk: the Mac restarts with it (as a power cycle).
 void restartWithDisks(const char *title) {
@@ -930,21 +1002,33 @@ void restartWithDisks(const char *title) {
 
 int mac_menuItems(CoreMenuItem *out, int max) {
   if (max < ROW_COUNT) return 0;
-  snprintf(s_speedName, sizeof s_speedName, "%dx", g_settings.speed);
-  s_diskName = baseName(s_diskPath);
-  s_disk2Name = baseName(s_disk2Path);
+  snprintf(s_speedName, sizeof s_speedName, "%dx", plusSpeed());
   out[ROW_SNAP_LOAD] = { "Load snapshot", nullptr, false, ui::ICON_LOAD };
   out[ROW_SNAP_SAVE] = { "Save snapshot", nullptr, false, ui::ICON_SAVE };
+  out[ROW_DRIVES] = { "Drives", nullptr, false, ui::ICON_FOLDER };
   out[ROW_SCREEN] = { "Screen", kScreenNames[g_settings.screen], true, ui::ICON_PAD };
   out[ROW_SPEED] = { "CPU speed", s_speedName, true, ui::ICON_SKIP };
   out[ROW_ARROWS] = { "Arrows (both Shifts)", kArrowNames[g_settings.arrows], true, ui::ICON_PAD };
-  out[ROW_DISK] = { "Boot disk", s_diskName.c_str(), false, ui::ICON_FOLDER };
-  // Enter picks the second disk, </> eject it
-  out[ROW_DISK2] = { "Second disk", s_disk2Name.c_str(), !s_disk2Path.empty(), ui::ICON_FOLDER };
   return ROW_COUNT;
 }
 
+// Drives: the Plus's two floppy drives; any change restarts the Mac with the new disks.
+bool drivesMenu() {
+  macdrives::Drive drives[2] = {
+    { "Boot disk", s_diskPath, "Restarts the Mac", ui::ICON_SAVE },
+    { "Second disk", s_disk2Path, "Restarts the Mac", ui::ICON_LOAD },
+  };
+  return macdrives::menu(kMacPlus, drives, 2, [](int i, const std::string &path) {
+    (i ? g_settings.disk2 : g_settings.disk) = path;
+    settingsSave();
+    (i ? s_disk2Path : s_diskPath) = path;
+    restartWithDisks(i ? "Second disk" : "Boot disk");
+    return true;
+  });
+}
+
 bool mac_menuAction(int index, uint8_t key) {
+  if (index == ROW_DRIVES) return key == KEY_ENTER && drivesMenu();
   const int d = key == KEY_LEFT ? -1 : 1;
   switch (index) {
     case ROW_SNAP_SAVE: {
@@ -970,36 +1054,13 @@ bool mac_menuAction(int index, uint8_t key) {
       return false;
     }
     case ROW_SPEED:
-      g_settings.speed = (g_settings.speed - 1 + d + 4) % 4 + 1;
-      umac_set_speed(g_settings.speed);
+      g_settings.speed = (plusSpeed() - 1 + d + 4) % 4 + 1;
+      umac_set_speed(plusSpeed());
       return false;
     case ROW_ARROWS:
       g_settings.arrows = (g_settings.arrows + d + ARROWS_COUNT) % ARROWS_COUNT;
       s_arrows = 0;
       return false;
-    case ROW_DISK: {
-      if (key != KEY_ENTER) return false;
-      std::string path;
-      if (!browseRom(kMacPlus, path)) return false;
-      g_settings.disk = path;
-      settingsSave();
-      s_diskPath = path;
-      restartWithDisks("Boot disk");
-      return true;
-    }
-    case ROW_DISK2: {
-      std::string path;
-      if (key == KEY_ENTER) {
-        if (!browseRom(kMacPlus, path)) return false;
-      } else if (s_disk2Path.empty()) {
-        return false;
-      }
-      g_settings.disk2 = path;
-      settingsSave();
-      s_disk2Path = path;
-      restartWithDisks("Second disk");
-      return true;
-    }
   }
   return false;
 }

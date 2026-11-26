@@ -3,6 +3,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string>
 #include <vector>
 
@@ -15,16 +16,24 @@ struct MacSnapMachine {
   int ram = 0, screen = 0;
 };
 
+// What a core gives: its screen's pixels (0x00RRGGBB) for the picture, and its machine state
+// written to / read from the file (read: 0 = done, -2 = another version, nothing loaded; other =
+// failed half way).
+typedef uint32_t (*MacSnapPixel)(int x, int y);
+typedef bool (*MacSnapWrite)(FILE *f);
+typedef int (*MacSnapRead)(FILE *f);
+
+// The snapshots of the machine g_settings.machine names (each Mac has its own).
 std::vector<MacSnapshot> macsnap_list();                     // newest first
-// Saves the running Mac (between frames) as `name`, with fb (w x h, 1 bit a pixel, set = black)
-// as its picture. replace: a snapshot this one takes the place of, deleted once the new one is
-// written. null, or why not.
+// Saves the running Mac (between frames) as `name`, with its w x h screen as the picture.
+// replace: a snapshot this one takes the place of, deleted once the new one is written. null, or
+// why not.
 const char *macsnap_save(const std::string &name, const std::string &replace, const MacSnapMachine &m,
-                         const uint8_t *fb, int w, int h);
+                         MacSnapPixel pixel, int w, int h, MacSnapWrite state);
 bool macsnap_machine(const std::string &snap, MacSnapMachine &m);
 // The state into the Mac, once it was started with the snapshot's machine. null, or why not;
 // *broken = the Mac was left half loaded and must be started again.
-const char *macsnap_restore(const std::string &snap, bool *broken);
+const char *macsnap_restore(const std::string &snap, bool *broken, MacSnapRead state);
 // Whether a disk the snapshot had was written since it was taken.
 bool macsnap_disks_changed(const std::string &snap);
 // A disk's first write since the Mac started or the last snapshot: its generation goes up.

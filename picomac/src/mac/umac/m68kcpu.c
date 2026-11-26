@@ -48,7 +48,11 @@ extern void m68881_mmu_ops(void);
 #include "m68kcpu.h"
 
 #include "m68kfpu_inc.h"   // pico-mac: was m68kfpu.c; Arduino would compile it on its own, and copies no .inc
+#ifdef M68K_MMU_HEADER   // pico-mac: the Mac IIci's 68030 brings its own PMMU instructions
+#include M68K_MMU_HEADER
+#else
 #include "m68kmmu.h" // uses some functions from m68kfpu.c which are static !
+#endif
 
 
 #if M68K_DYNAMIC_INSTR_TABLES
@@ -809,7 +813,9 @@ void m68k_set_instr_hook_callback(void  (*callback)(unsigned int pc))
 /* Set the CPU type. */
 void m68k_set_cpu_type(unsigned int cpu_type)
 {
-#ifdef M68K_FIXED_CPU_TYPE
+#ifdef M68K_FIXED_CPU_API   /* pico-mac: the M68K_CPU_TYPE_* the fixed type stands for */
+	assert(cpu_type == M68K_FIXED_CPU_API);
+#elif defined(M68K_FIXED_CPU_TYPE)
 	assert(cpu_type == M68K_FIXED_CPU_TYPE);
 #endif
 	switch(cpu_type)
@@ -974,6 +980,11 @@ void m68k_set_cpu_type(unsigned int cpu_type)
 	}
 }
 
+/* pico-mac: the config may replace the dispatch (the Mac II's 16-bit index table, m68kconf020.h) */
+#ifndef M68K_DISPATCH
+#define M68K_DISPATCH(ir) instruction_jump_table[ir]()
+#endif
+
 /* Execute some instructions until we use up num_cycles clock cycles */
 /* ASG: removed per-instruction interrupt checks */
 int M68K_FAST_FUNC(m68k_execute)(int num_cycles)
@@ -1025,7 +1036,7 @@ int M68K_FAST_FUNC(m68k_execute)(int num_cycles)
 #endif
 			/* Read an instruction and call its handler */
 			REG_IR = m68ki_read_opcode_16();
-			instruction_jump_table[REG_IR]();
+			M68K_DISPATCH(REG_IR);
 			USE_CYCLES(CYC_INSTRUCTION(REG_IR));
 
 			/* Trace m68k_exception, if necessary */
