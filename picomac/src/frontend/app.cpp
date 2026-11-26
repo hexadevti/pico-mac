@@ -284,8 +284,10 @@ static bool confirm(const char *title, const char *yes, const char *no) {
 }
 
 // A drive of the startup: choose an image or eject it (mac_drives.h, as the in-game Drives).
+// drive: 0 disk, 1 disk2, 2 hd2, 3 floppy2, 4 cdrom.
 static void chooseDrive(int drive, const char *name) {
-  std::string &path = drive ? g_settings.disk2 : g_settings.disk;
+  std::string &path = drive == 0 ? g_settings.disk : drive == 1 ? g_settings.disk2 : drive == 2 ? g_settings.hd2
+                    : drive == 3 ? g_settings.floppy2 : g_settings.cdrom;
   const macdrives::Drive d = { name, path, drive ? "Any disk image" : "The Mac starts from it", ui::ICON_FOLDER };
   std::string out;
   const int r = macdrives::choose(machineCore(), d, out);
@@ -303,7 +305,7 @@ static bool startupScreen(const std::string &path, bool canDelete) {
   ui::Screen scr;
   scr.hints = "Enter|Select;<>|Change;Esc|Back";
   int sel = 0;
-  enum { S_START, S_SNAP, S_MACHINE, S_DISK, S_DISK2, S_ROM, S_RAM, S_SCREEN, S_SPEED, S_RENAME, S_DELETE };
+  enum { S_START, S_SNAP, S_MACHINE, S_DISK, S_DISK2, S_HD2, S_FLOPPY2, S_CDROM, S_ROM, S_RAM, S_SCREEN, S_SPEED, S_RENAME, S_DELETE };
   bool ran = false;
   while (!ran) {
     ui::Item items[16];
@@ -311,9 +313,11 @@ static bool startupScreen(const std::string &path, bool canDelete) {
     int n = 0;
     const bool ii = g_settings.machine != MACHINE_PLUS;   // the colour Macs
     const bool iici = g_settings.machine == MACHINE_IICI, quadra = g_settings.machine == MACHINE_QUADRA;
-    const char *disk1Label = ii ? "Hard disk" : "Boot disk";
-    const char *disk2Label = ii ? "Floppy" : "Second disk";
+    const char *disk1Label = ii ? "Hard disk 1" : "Boot disk";
+    const char *disk2Label = ii ? "Floppy 1" : "Second disk";
     const std::string diskName = macdrives::fileName(g_settings.disk), disk2Name = macdrives::fileName(g_settings.disk2);
+    const std::string hd2Name = macdrives::fileName(g_settings.hd2), floppy2Name = macdrives::fileName(g_settings.floppy2);
+    const std::string cdromName = macdrives::fileName(g_settings.cdrom);
     const std::string &romRel = romPathOf();
     const std::string romShown = fileExists(sdPath(romRel.c_str())) ? fileName(romRel) : "Missing";
     char speed[8], snaps[8];
@@ -332,7 +336,10 @@ static bool startupScreen(const std::string &path, bool canDelete) {
     items[n] = { "Snapshots", snaps, ui::ICON_LOAD, "Start from one, or delete one" }; kind[n++] = S_SNAP;
     items[n] = { "Machine", kMachineNames[g_settings.machine], ui::ICON_GEAR, nullptr, -1, true }; kind[n++] = S_MACHINE;
     items[n] = { disk1Label, diskName.c_str(), ui::ICON_SAVE }; kind[n++] = S_DISK;
+    if (ii) { items[n] = { "Hard disk 2", hd2Name.c_str(), ui::ICON_SAVE }; kind[n++] = S_HD2; }
     items[n] = { disk2Label, disk2Name.c_str(), ui::ICON_LOAD }; kind[n++] = S_DISK2;
+    if (ii) { items[n] = { "Floppy 2", floppy2Name.c_str(), ui::ICON_LOAD }; kind[n++] = S_FLOPPY2; }
+    if (ii) { items[n] = { "CD-ROM", cdromName.c_str(), ui::ICON_LOAD }; kind[n++] = S_CDROM; }
     items[n] = { "ROM", romShown.c_str(), ui::ICON_CART, "Shared by this machine's startups" }; kind[n++] = S_ROM;
     items[n] = { "RAM", quadra ? kRam4Names[g_settings.ramQuadra] : iici ? kRam3Names[g_settings.ramIIci] : ii ? kRam2Names[g_settings.ramII] : kRamNames[g_settings.ram], ui::ICON_GEAR, nullptr, -1, true }; kind[n++] = S_RAM;
 #if !defined(EMU_WEB)   // the page shows the Mac's own picture, never the panel's
@@ -380,6 +387,9 @@ static bool startupScreen(const std::string &path, bool canDelete) {
         break;
       case S_DISK: if (k == KEY_ENTER) chooseDrive(0, disk1Label); break;
       case S_DISK2: if (k == KEY_ENTER) chooseDrive(1, disk2Label); break;
+      case S_HD2: if (k == KEY_ENTER) chooseDrive(2, "Hard disk 2"); break;
+      case S_FLOPPY2: if (k == KEY_ENTER) chooseDrive(3, "Floppy 2"); break;
+      case S_CDROM: if (k == KEY_ENTER) chooseDrive(4, "CD-ROM"); break;
       case S_ROM: if (k == KEY_ENTER) chooseRom(); break;
       case S_RAM:
         if (!change) break;
@@ -527,6 +537,9 @@ void app_loop() {
     settingsSetMachine(!strcmp(m, "ii") ? MACHINE_II : !strcmp(m, "iici") ? MACHINE_IICI
                        : !strcmp(m, "quadra") ? MACHINE_QUADRA : MACHINE_PLUS);
   if (const char *disk2 = getenv("MAC_DISK2")) g_settings.disk2 = disk2;              // test hook
+  if (const char *v = getenv("MAC_HD2")) g_settings.hd2 = v;                          // test hooks: the Mac II family's
+  if (const char *v = getenv("MAC_FLOPPY2")) g_settings.floppy2 = v;                  // other drives
+  if (const char *v = getenv("MAC_CDROM")) g_settings.cdrom = v;
   if (const char *rom = getenv("MAC_ROM2")) g_settings.romPathII = rom;               // test hook (relative to the card)
   if (const char *rom = getenv("MAC_ROM3")) g_settings.romPathIIci = rom;             // test hook: the IIci's
   if (const char *rom = getenv("MAC_ROM4")) g_settings.romPathQuadra = rom;           // test hook: the Quadra's

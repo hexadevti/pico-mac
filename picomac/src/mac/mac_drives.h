@@ -56,9 +56,9 @@ template <class Apply>
 bool menu(const EmuCore &core, Drive *drives, int n, Apply apply) {
   int sel = 0;
   for (;;) {
-    ui::Item items[4];
-    std::string label[4];
-    for (int i = 0; i < n && i < 4; i++) {
+    ui::Item items[8];
+    std::string label[8];
+    for (int i = 0; i < n && i < 8; i++) {
       label[i] = fileName(drives[i].path);
       items[i] = { drives[i].name, label[i].c_str(), drives[i].icon, drives[i].note };
     }

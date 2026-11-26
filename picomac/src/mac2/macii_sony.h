@@ -7,9 +7,10 @@
 // (Basilisk II (C) 1997-2008 Christian Bauer, GPLv2; umac (C) 2024 Matt Evans). The 68k driver is
 // umac's sonydrv.S (docs/umac) with opcodes instead of its magic address, hand-assembled.
 //
-// Open adds both drives, empty or not: drive 1 (the boot disk) and drive 2, whose disk is mounted
-// once the Mac is up (accRun posts a diskEvt for it). A disk can go into drive 2 at any time while
-// it is empty (insert()); the Mac ejects it (Control 7) when it is dragged to the Trash.
+// Open adds all five drives, empty or not: drive 1 (hard disk 1, the boot disk), then floppy 1,
+// hard disk 2, floppy 2 and the CD-ROM, whose disks are mounted once the Mac is up (accRun posts a diskEvt for
+// each). A disk can go into an empty drive at any time (insert(); the core does it for the
+// floppies and the CD); the Mac ejects it (Control 7) when it is dragged to the Trash.
 #pragma once
 
 #include <stdint.h>
@@ -20,7 +21,7 @@
 namespace sony {
 
 constexpr uint16_t kOpOpen = 0x7120, kOpPrime = 0x7121, kOpControl = 0x7122, kOpStatus = 0x7123;
-constexpr int kDrives = 2;
+constexpr int kDrives = 5;
 
 // The driver: header, name, code. Branches are byte displacements from the word after them.
 const uint16_t kDriver[] = {
@@ -295,7 +296,10 @@ class Drives {
       bus_.wr8(st + dsMFMDrive, 0);
       bus_.wr8(st + dsMFMDisk, 0);
     }
-    bus_.wr8(st + dsDiskInPlace, im.f ? 1 : 0);
+    // A floppy goes in at the first accRun, once the system runs: in place at power-on, the start-up
+    // code ejects it (not a start-up disk). The hard disks (not ejectable) are there from the start.
+    const bool floppy = im.size <= kFloppyMax;
+    bus_.wr8(st + dsDiskInPlace, im.f && (index == 0 || !floppy) ? 1 : 0);
     bus_.wr8(st + dsWriteProt, im.readOnly ? 0xFF : 0);
     d.toMount = index > 0 && im.f;                  // the boot drive is mounted by the boot
     return (int32_t)((uint32_t)num << 16 | refNum(dce, st, im));
@@ -361,7 +365,11 @@ class Drives {
     if (code == 9) return err(noErr);               // track cache
     if (code == 65) {                               // accRun: a drive to mount
       for (Drive &d : drive_)
-        if (d.status && d.toMount) { d.toMount = false; return d.num; }
+        if (d.status && d.toMount) {
+          d.toMount = false;
+          bus_.wr8(d.status + dsDiskInPlace, 1);
+          return d.num;
+        }
       return err(noErr);
     }
     const int i = find((int16_t)bus_.rd16(pb + ioVRefNum));

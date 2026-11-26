@@ -37,8 +37,8 @@ bool makeDirs(const std::string &path) {
   return mkOne(path);
 }
 
-// Each machine's own disk, disk2, screen and speed; g_settings has the current machine's.
-struct PerMachine { std::string disk, disk2; int screen = SCREEN_FIT, speed = 1; };
+// Each machine's own disks, screen and speed; g_settings has the current machine's.
+struct PerMachine { std::string disk, disk2, hd2, floppy2, cdrom; int screen = SCREEN_FIT, speed = 1; };
 static PerMachine s_per[MACHINE_COUNT];
 #if defined(ESP_PLATFORM)
 static const char *const kSuffix[MACHINE_COUNT] = { "", "_ii" };
@@ -48,13 +48,15 @@ static const char *const kSuffix[MACHINE_COUNT] = { "", "_ii", "_iici", "_quadra
 
 static void keepCurrent() {
   PerMachine &p = s_per[g_settings.machine];
-  p.disk = g_settings.disk; p.disk2 = g_settings.disk2; p.screen = g_settings.screen; p.speed = g_settings.speed;
+  p.disk = g_settings.disk; p.disk2 = g_settings.disk2; p.hd2 = g_settings.hd2; p.floppy2 = g_settings.floppy2; p.cdrom = g_settings.cdrom;
+  p.screen = g_settings.screen; p.speed = g_settings.speed;
 }
 
 static void useMachine(int m) {
   const PerMachine &p = s_per[m];
   g_settings.machine = m;
-  g_settings.disk = p.disk; g_settings.disk2 = p.disk2; g_settings.screen = p.screen; g_settings.speed = p.speed;
+  g_settings.disk = p.disk; g_settings.disk2 = p.disk2; g_settings.hd2 = p.hd2; g_settings.floppy2 = p.floppy2; g_settings.cdrom = p.cdrom;
+  g_settings.screen = p.screen; g_settings.speed = p.speed;
 }
 
 void settingsSetMachine(int m) {
@@ -96,6 +98,9 @@ void settingsLoad() {
       PerMachine &p = s_per[m];
       if (!strcmp(key, "disk"))   { p.disk = v; continue; }
       if (!strcmp(key, "disk2"))  { p.disk2 = v; continue; }
+      if (!strcmp(key, "hd2"))    { p.hd2 = v; continue; }
+      if (!strcmp(key, "floppy2")) { p.floppy2 = v; continue; }
+      if (!strcmp(key, "cdrom"))  { p.cdrom = v; continue; }
       if (!strcmp(key, "screen")) { p.screen = atoi(v); continue; }
       if (!strcmp(key, "speed"))  { p.speed = atoi(v); continue; }
     }
@@ -148,6 +153,9 @@ void settingsSave() {
   for (int m = 0; m < MACHINE_COUNT; m++)
     fprintf(f, "disk%s=%s\ndisk2%s=%s\nscreen%s=%d\nspeed%s=%d\n", kSuffix[m], s_per[m].disk.c_str(),
             kSuffix[m], s_per[m].disk2.c_str(), kSuffix[m], s_per[m].screen, kSuffix[m], s_per[m].speed);
+  for (int m = 1; m < MACHINE_COUNT; m++)          // the Mac II family's other drives
+    fprintf(f, "hd2%s=%s\nfloppy2%s=%s\ncdrom%s=%s\n", kSuffix[m], s_per[m].hd2.c_str(), kSuffix[m],
+            s_per[m].floppy2.c_str(), kSuffix[m], s_per[m].cdrom.c_str());
   fclose(f);
   startup_save_active();                         // the startup running, if any, keeps its changes
 }

@@ -26,6 +26,10 @@ first.
   ncr5380.h (SCSI, no targets yet), macii_slotrom.h (the card's declaration ROM and its driver,
   which calls the emulator through opcodes 0x7110-0x7114), macii_sony.h (disks: our .Sony,
   patched over the ROM's at power-on, opcodes 0x7120-0x7123; the ROM checksum is recomputed),
+  five drives in this order: Hard disk 1 (boot; settings key disk), Floppy 1 (disk2), Hard disk 2 (hd2),
+  Floppy 2 (floppy2), CD-ROM (cdrom, read-only). Floppies and the CD swap while the Mac runs; a hard disk
+  change restarts it. A floppy is put in place only at the first accRun: in place at power-on, the
+  start-up code ejects it (Control 7) as a non-start-up disk. An old disk2 bigger than a floppy moves to hd2.
   rtc.h (clock + 256-byte XPRAM in picomac/pram2.bin; SPConfig always reads "async": with no SCC,
   AppleTalk hangs the boot), asc.h (the Apple Sound Chip, FIFO and wavetable; its IRQ is VIA2 CB1; 0x804 is read-only and its half/empty bits are levels: the Sound Manager refills only on the half bit, and edge-only flags muted PoP).
   Speed on the P4: macii_iram.h puts the hot 68020 handlers in IRAM (regenerate the list from a
@@ -95,7 +99,7 @@ first.
 - Desktop (MSYS2 MinGW32 + SDL2):
   `MSYSTEM=MINGW32 /c/msys64/usr/bin/bash.exe -lc "cd /c/Users/lucia/repos/pico-mac && cmake -G 'Unix Makefiles' -S . -B build -DCMAKE_BUILD_TYPE=Debug && make -C build -j8"`
   - umac is always built at -O2.
-  - Test hooks: MAC_SD, MAC_DISK, MAC_DISK2 (second drive), MAC_SNAP (start from a .snp), MAC_MACHINE=ii
+  - Test hooks: MAC_SD, MAC_DISK, MAC_DISK2 (second drive; Floppy 1 on the Mac II family), MAC_HD2, MAC_FLOPPY2, MAC_CDROM, MAC_SNAP (start from a .snp), MAC_MACHINE=ii
     (the Mac II core), MAC_ROM2 (its ROM, relative to MAC_SD), MAC_KEYS
     ("w1500,shot,quit"), MAC_SHOT.
 - A hung Mac: "@mac" on the P4 console (COM9, 115200; open it with DTR/RTS off, or the board

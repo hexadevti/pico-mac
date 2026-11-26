@@ -27,7 +27,9 @@ struct Settings {
   int screen = SCREEN_FIT;
   int speed = 1;             // CPU speed multiplier: 1 = a real Mac Plus, up to 4
   std::string disk;          // the boot disk image (full path), "" = none yet
-  std::string disk2;         // a second disk (drive 2), "" = none
+  std::string disk2;         // a second disk (drive 2; the Mac II family's Floppy 1), "" = none
+  std::string hd2, floppy2;  // the Mac II family's Hard disk 2 and Floppy 2
+  std::string cdrom;         // and its CD-ROM (read-only)
   int arrows = 1;            // what the arrows do: 0 Mac arrow keys, 1 the pointer, 2 both
   int machine = MACHINE_PLUS;
   std::string romPathII = "picomac/macii.rom";   // the Mac II's ROM, relative to the card root
@@ -43,7 +45,7 @@ extern Settings g_settings;
 
 void settingsLoad();
 void settingsSave();
-// disk, disk2, screen and speed are per machine: g_settings holds the current machine's, and
+// disk, disk2, hd2, floppy2, cdrom, screen and speed are per machine: g_settings holds the current machine's, and
 // this keeps them aside and brings in machine m's (then saves).
 void settingsSetMachine(int m);
 

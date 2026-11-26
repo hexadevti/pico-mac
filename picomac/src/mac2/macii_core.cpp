@@ -36,6 +36,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <time.h>
 #include <algorithm>
@@ -128,8 +129,17 @@ uint8_t *s_ram = nullptr;
 uint32_t s_ramSize = 0;
 uint8_t *s_rom = nullptr;
 sony::Drives s_sony;                // the disks, through our .Sony driver (macii_sony.h)
-std::string s_diskPath;             // drive 1, the boot disk ("" = none)
-std::string s_disk2Path;            // drive 2 ("" = none)
+// The drives' images ("" = none), as macii_sony.h's indexes: hard disk 1 (the boot disk), floppy 1,
+// hard disk 2, floppy 2, the CD-ROM (read-only). In the settings: disk, disk2, hd2, floppy2, cdrom.
+std::string s_path[sony::kDrives];
+std::string &s_diskPath = s_path[0];
+const char *const kDriveNames[sony::kDrives] = { "Hard disk 1", "Floppy 1", "Hard disk 2", "Floppy 2", "CD-ROM" };
+constexpr int kCdrom = 4;
+inline bool isFloppy(int i) { return i == 1 || i == 3 || i == kCdrom; }   // swapped while the Mac runs
+std::string &settingOf(int i) {
+  return i == 0 ? g_settings.disk : i == 1 ? g_settings.disk2 : i == 2 ? g_settings.hd2
+       : i == 3 ? g_settings.floppy2 : g_settings.cdrom;
+}
 bool s_touched[sony::kDrives];      // the drive was written since the start or the last snapshot
 bool s_running = false;
 char s_error[96];
@@ -1534,18 +1544,19 @@ bool powerOn() {
 #endif
   if (!sony::patchRom(s_rom, kRomSize)) { snprintf(s_error, sizeof s_error, "No .Sony driver in the ROM"); return false; }
 
-  const std::string paths[sony::kDrives] = { s_diskPath, s_disk2Path };
   for (bool &t : s_touched) t = false;    // a new start: the next write is a new generation
-  const char *what[sony::kDrives] = { "boot disk", "second disk" };
   for (int i = 0; i < sony::kDrives; i++) {
     s_sony.image[i].close();
-    if (paths[i].empty() || (i > 0 && paths[i] == paths[0])) continue;
+    bool twice = false;                     // an image in two drives: the first one has it
+    for (int k = 0; k < i; k++) twice = twice || s_path[k] == s_path[i];
+    if (s_path[i].empty() || twice) continue;
     char err[96];
-    if (!s_sony.image[i].open(paths[i].c_str(), err, sizeof err)) {
-      snprintf(s_error, sizeof s_error, "The %s: %s", what[i], err);
+    if (!s_sony.image[i].open(s_path[i].c_str(), err, sizeof err)) {
+      snprintf(s_error, sizeof s_error, "%s: %s", kDriveNames[i], err);
       return false;
     }
-    hal_log("macii: %s %s, %u KB%s", what[i], paths[i].c_str(), (unsigned)(s_sony.image[i].size >> 10),
+    if (i == kCdrom) s_sony.image[i].readOnly = true;
+    hal_log("macii: %s %s, %u KB%s", kDriveNames[i], s_path[i].c_str(), (unsigned)(s_sony.image[i].size >> 10),
             s_sony.image[i].readOnly ? ", read-only" : "");
   }
 
@@ -2031,8 +2042,11 @@ void saveSnapshot() {
   showNote("Saving snapshot...");
   for (sony::Image &im : s_sony.image) im.flush();
   MacSnapMachine m;
-  m.disk = s_diskPath;
-  m.disk2 = s_disk2Path;
+  m.disk = s_path[0];
+  m.disk2 = s_path[1];
+  m.hd2 = s_path[2];
+  m.floppy2 = s_path[3];
+  m.cdrom = s_path[4];
   m.rom = g_romPath;
   for (int i = 0; i < RAM2_COUNT; i++) if (kRamSizes[i] == s_ramSize) m.ram = i;
   m.screen = s_screenLive;
@@ -2049,14 +2063,12 @@ void saveSnapshot() {
 bool startFromSnapshot(const std::string &snap) {
   MacSnapMachine m;
   if (!macsnap_machine(snap, m)) { snprintf(s_error, sizeof s_error, "Cannot read the snapshot"); return false; }
-  g_settings.disk = m.disk;
-  g_settings.disk2 = m.disk2;
+  const std::string paths[sony::kDrives] = { m.disk, m.disk2, m.hd2, m.floppy2, m.cdrom };
+  for (int i = 0; i < sony::kDrives; i++) settingOf(i) = s_path[i] = paths[i];
   g_romPath = m.rom;
   g_ramIndex = m.ram;
   g_settings.screen = m.screen;
   settingsSave();
-  s_diskPath = m.disk;
-  s_disk2Path = m.disk2;
   s_screenLive = m.screen == SCREEN_PAN ? SCREEN_PAN : SCREEN_FIT;
   releaseAll();
   if (!powerOn()) return false;
@@ -2242,14 +2254,22 @@ bool macii_init() {
   return s_rom && s_vram && macii_op_index;
 }
 
-// path: the boot disk image, or "" for none. The second disk is g_settings.disk2. A snapshot set
-// with macsnap_set_pending is started from instead.
+// path: the boot disk image (hard disk 1), or "" for none. The other drives are g_settings.disk2
+// (floppy 1), hd2 and floppy2. A snapshot set with macsnap_set_pending is started from instead.
 bool macii_loadRom(const char *path) {
   const std::string snap = macsnap_take_pending();
   s_snapSave.clear();
   s_snapLoad.clear();
   s_diskPath = path ? path : "";
-  s_disk2Path = g_settings.disk2;
+  // From before four drives: the second disk was the floppy, or a hard disk if it was bigger.
+  struct stat st;
+  if (!g_settings.disk2.empty() && g_settings.hd2.empty() && !stat(g_settings.disk2.c_str(), &st) &&
+      st.st_size > 1440 * 1024 + 84) {
+    g_settings.hd2 = g_settings.disk2;
+    g_settings.disk2.clear();
+    settingsSave();
+  }
+  for (int i = 1; i < sony::kDrives; i++) s_path[i] = settingOf(i);
   s_screenLive = g_settings.screen == SCREEN_PAN ? SCREEN_PAN : SCREEN_FIT;
   s_via1.irq = viaIrq;
 #if !defined(MACII_IICI)
@@ -2353,7 +2373,7 @@ void macii_runFrame(bool draw) {
   for (int i = 0; i < sony::kDrives; i++)
     if (s_sony.image[i].written) {
       s_sony.image[i].written = false;
-      if (!s_touched[i]) { s_touched[i] = true; macsnap_touch(i ? s_disk2Path : s_diskPath); }
+      if (!s_touched[i]) { s_touched[i] = true; macsnap_touch(s_path[i]); }
     }
   // The frame's end: VIA1 CA1 is the 60.15 Hz interrupt, CA2 the 1 Hz one; the card's VBL.
   s_via1.pulse(Via6522::CA1);
@@ -2465,7 +2485,7 @@ int colorsMode() {
   return m >= 0 && m <= 3 ? m : 0;
 }
 
-// A new boot or second disk: the Mac restarts with it (as a power cycle).
+// A new hard disk: the Mac restarts with it (as a power cycle).
 void restartWithDisks(const char *title) {
   ui::message(title, "Restarting the Mac", 600);
   hal_job_wait();
@@ -2478,21 +2498,28 @@ void restartWithDisks(const char *title) {
   }
 }
 
-// Puts path ("" = none) into drive 2 while the Mac runs: 1 done, 0 the Mac must restart for it
-// (its driver has no drive 2 yet), -1 not done (*why says why).
-int setDisk2(const std::string &path, const char **why) {
+// Another drive already holds `path`: its name, or null.
+const char *driveWith(const std::string &path, int except) {
+  for (int k = 0; k < sony::kDrives; k++) if (k != except && !path.empty() && s_path[k] == path) return kDriveNames[k];
+  return nullptr;
+}
+
+// Puts path ("" = none) into floppy drive i while the Mac runs: 1 done, 0 the Mac must restart for
+// it (its driver has no drives yet), -1 not done (*why says why).
+int setFloppy(int i, const std::string &path, const char **why) {
   static char err[96];
-  if (s_sony.hasDisk(1)) { *why = "Eject it in the Mac first (drag it to the Trash)"; return -1; }
-  if (!path.empty() && path == s_diskPath) { *why = "That is the boot disk"; return -1; }
-  sony::Image &im = s_sony.image[1];
+  if (s_sony.hasDisk(i)) { *why = "Eject it in the Mac first (drag it to the Trash)"; return -1; }
+  if (const char *other = driveWith(path, i)) { snprintf(err, sizeof err, "That disk is in %s", other); *why = err; return -1; }
+  sony::Image &im = s_sony.image[i];
   im.close();
-  if (!path.empty() && !im.open(path.c_str(), err, sizeof err)) { *why = err; s_disk2Path.clear(); return -1; }
-  g_settings.disk2 = path;
+  if (!path.empty() && !im.open(path.c_str(), err, sizeof err)) { *why = err; s_path[i].clear(); return -1; }
+  if (i == kCdrom) im.readOnly = true;
+  settingOf(i) = path;
   settingsSave();
-  s_disk2Path = path;
-  s_touched[1] = false;
-  if (!s_sony.installed(1)) return 0;
-  if (!path.empty()) s_sony.insert(1);
+  s_path[i] = path;
+  s_touched[i] = false;
+  if (!s_sony.installed(i)) return 0;
+  if (!path.empty()) s_sony.insert(i);
   return 1;
 }
 
@@ -2512,33 +2539,45 @@ int macii_menuItems(CoreMenuItem *out, int max) {
   return ROW_COUNT;
 }
 
-// Drives: the hard disk the Mac starts from (a change restarts it) and drive 2, the floppy, which
-// takes any image at once while it is empty (a disk the Mac has mounted is ejected there first).
+// Drives: the two hard disks (a change restarts the Mac; it starts from hard disk 1), the two
+// floppies and the CD-ROM, which take any image at once while empty (a disk the Mac has mounted is
+// ejected there first).
+constexpr int kMenuOrder[sony::kDrives] = { 0, 2, 1, 3, 4 };   // the hard disks first
+
 bool drivesMenu() {
-  macdrives::Drive drives[2] = {
-    { "Hard disk", s_diskPath, "The Mac starts from it: a change restarts it", ui::ICON_SAVE },
-    { "Floppy", s_disk2Path, "Any disk image; goes in at once", ui::ICON_LOAD },
-  };
-  return macdrives::menu(kMacII, drives, 2, [](int i, const std::string &path) {
-    if (i == 0) {
+  macdrives::Drive drives[sony::kDrives];
+  for (int r = 0; r < sony::kDrives; r++) {
+    const int i = kMenuOrder[r];
+    drives[r] = { kDriveNames[i], s_path[i],
+                  i == 0 ? "The Mac starts from it: a change restarts it"
+                         : i == kCdrom ? "A CD image (.iso, .cdr, .toast); read-only, goes in at once"
+                         : isFloppy(i) ? "Any disk image; goes in at once" : "A change restarts the Mac",
+                  isFloppy(i) ? ui::ICON_LOAD : ui::ICON_SAVE };
+  }
+  return macdrives::menu(kMacII, drives, sony::kDrives, [](int r, const std::string &path) {
+    const int i = kMenuOrder[r];
+    if (!isFloppy(i)) {
       if (!path.empty()) {
-        if (path == s_disk2Path) { ui::message("Hard disk", "That disk is in the floppy drive", 2000); return false; }
+        if (const char *other = driveWith(path, i)) {
+          ui::message(kDriveNames[i], (std::string("That disk is in ") + other).c_str(), 2000);
+          return false;
+        }
         sony::Image test;                           // not a disk image: say so, keep the Mac running
         char err[96];
-        if (!test.open(path.c_str(), err, sizeof err)) { ui::message("Hard disk", err, 2500); return false; }
+        if (!test.open(path.c_str(), err, sizeof err)) { ui::message(kDriveNames[i], err, 2500); return false; }
         test.close();
       }
-      g_settings.disk = path;
+      settingOf(i) = path;
       settingsSave();
-      s_diskPath = path;
-      restartWithDisks("Hard disk");
+      s_path[i] = path;
+      restartWithDisks(kDriveNames[i]);
       return true;
     }
     const char *why = nullptr;
-    const int r = setDisk2(path, &why);
-    if (r < 0) { ui::message("Floppy", why, 2500); return false; }
-    if (r == 0) restartWithDisks("Floppy");         // the Mac is still starting: no drive 2 yet
-    else ui::message("Floppy", path.empty() ? "Ejected" : macdrives::fileName(path).c_str(), 700);
+    const int res = setFloppy(i, path, &why);
+    if (res < 0) { ui::message(kDriveNames[i], why, 2500); return false; }
+    if (res == 0) restartWithDisks(kDriveNames[i]); // the Mac is still starting: no drives yet
+    else ui::message(kDriveNames[i], path.empty() ? "Ejected" : macdrives::fileName(path).c_str(), 700);
     return true;
   });
 }
@@ -2813,12 +2852,12 @@ void maciicore_mouse(int x, int y, int button) {
   if (button >= 0) { s_button = button != 0; s_adb.mouse(0, 0, s_button); }
 }
 
-// The desktop's MAC_KEYS "disk2": MAC_DISK2_LATER into drive 2 while it runs (as the menu does).
+// The desktop's MAC_KEYS "disk2": MAC_DISK2_LATER into floppy 1 while it runs (as the menu does).
 void maciicore_disk2(const char *path) {
   if (!s_running) return;
   const char *why = "";
-  const int r = setDisk2(path ? path : "", &why);
-  hal_log("macii: second disk %s: %s", path ? path : "(none)", r > 0 ? "inserted" : r == 0 ? "needs a restart" : why);
+  const int r = setFloppy(1, path ? path : "", &why);
+  hal_log("macii: floppy 1 %s: %s", path ? path : "(none)", r > 0 ? "inserted" : r == 0 ? "needs a restart" : why);
 }
 
 const EmuCore kMacII = {
