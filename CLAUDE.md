@@ -84,6 +84,8 @@ first.
   qType 1 with its size, Drive Info type 1, and a unit-table entry of its own (the installer refuses
   volumes on .Sony, refNum -5). A blank file initializes (Format succeeds); sdcard/picomac/MacOS81.dsk
   (512 MB) holds an 8.1 installed from the CD. Keep it HFS ("Mac OS Standard"): 68K Macs can't start from HFS+.
+  An 8.1 start-up patch (level-1 interrupt) searches for its own code with an ADD.W that loses the carry
+  across a 64 KB boundary and loops forever (16 MB, first extension icon): fixPatchSearch rewrites that loop.
   MAC_KEYS_FILE=<file> drives a long run step by step (each time the file appears, its text is the next script).
 - web/: the phone version (as pico-386's). web/src/hal_web.cpp (EMU_WEB) replaces the SDL HAL; the cores
   take the page's pointer once a frame (webPointer, EMU_WEB): absolute Mac pixels from the touch screen

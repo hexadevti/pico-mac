@@ -1858,6 +1858,31 @@ void webPointer() {
 }
 #endif
 
+// A bug in a Mac OS 8.1 start-up patch (it hooks the level-1 interrupt): looking for its own code
+// near the handler, it adds a skip offset with ADD.W, so when the code it finds straddles a 64 KB
+// boundary the sum loses the carry, the compare never matches and the search starts over for good
+// (16 MB on the Quadra after the five drives moved the system heap: "Starting up", the first icon).
+// While the CPU is in that loop, the three instructions become the same test done without the carry:
+//   move.l a4,d1 / add.w tbl(pc,d2.w),d1 / cmp.l a0,d1  ->  move.l a0,d1 / sub.l a4,d1 / cmp.w tbl(pc,d2.w),d1
+// and the loop's BRA back to the CMP goes to the MOVE (d1 is now worked out afresh each time).
+void fixPatchSearch() {
+  static const uint16_t kLoop[] = { 0xB5C8, 0x67E2, 0xB258, 0x66F8, 0x5588, 0x2848, 0x220C, 0xD27B, 0x203C,
+                                    0xB288, 0x670C, 0xB7C9, 0x6710, 0x3619, 0xB658, 0x66DA, 0x60F0 };
+  constexpr int kWords = sizeof kLoop / sizeof kLoop[0];
+  const uint32_t pc = m68k_get_reg(nullptr, M68K_REG_PC) & ~1u;
+  for (uint32_t at = pc - 2 * kWords; at <= pc; at += 2) {
+    uint8_t *h = gHost(at, 2 * kWords);
+    if (!h) continue;
+    int i = 0;
+    while (i < kWords && rd<2>(h + 2 * i) == kLoop[i]) i++;
+    if (i < kWords) continue;
+    wr<2>(h + 12, 0x2208); wr<2>(h + 14, 0x928C); wr<2>(h + 16, 0xB27B); wr<2>(h + 18, 0x203A);
+    wr<2>(h + 32, 0x60EA);
+    hal_log("macii: fixed the 8.1 patch search at %08x", (unsigned)at);
+    return;
+  }
+}
+
 // The coupling capacitor of the output stage (one-pole high-pass, ~20 Hz), as the Plus core.
 struct SoundFilter {
   float hpR, hpX = 0, hpY = 0;
@@ -2389,6 +2414,7 @@ void macii_runFrame(bool draw) {
   if (s_frames % 3600 == 0) opCountDump();
 #endif
   if (s_frames % 60 == 0) {
+    fixPatchSearch();
     for (sony::Image &im : s_sony.image) im.flush();
     if (s_rtc.dirty) savePram();
   }
