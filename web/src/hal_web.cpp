@@ -426,6 +426,7 @@ EMSCRIPTEN_KEEPALIVE void web_pointer(int x, int y, int buttons) {
   s_mabs.store(1, std::memory_order_release);
   setButtons(buttons);
 }
+EMSCRIPTEN_KEEPALIVE void web_cmd(const char *line) { if (hal_serial_cmd) hal_serial_cmd(line); }   // "@mac" from the console
 EMSCRIPTEN_KEEPALIVE void web_hidden(int h) { s_hidden.store(h ? 1 : 0); }
 EMSCRIPTEN_KEEPALIVE uint32_t web_frame_no() { return s_frameNo.load(std::memory_order_acquire); }
 EMSCRIPTEN_KEEPALIVE uint8_t *web_frame_ptr() { return s_rgba; }

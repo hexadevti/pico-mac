@@ -13,6 +13,7 @@ struct MacSnapshot { std::string path, name; };
 // root, as in the settings), RAM size (RAM_*) and screen mode (SCREEN_*).
 struct MacSnapMachine {
   std::string disk, disk2, rom;
+  std::string hd2, floppy2, cdrom;   // the Mac II family's other drives
   int ram = 0, screen = 0;
 };
 

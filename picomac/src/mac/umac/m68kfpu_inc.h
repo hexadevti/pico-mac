@@ -1478,6 +1478,68 @@ static void fpgen_rm_reg(uint16 w2)
 			USE_CYCLES(6);
 			break;
 		}
+		case 0x1f:		// FGETMAN (pico-mac): the mantissa, with the exponent 0
+		{
+			floatx80 d = source;
+			const int e = d.high & 0x7fff;
+			if (e != 0x7fff && d.low != 0) {
+				d = fx80_normalize(d);
+				d.high = (d.high & 0x8000) | 0x3fff;
+			}
+			REG_FP[dst] = d;
+			SET_CONDITION_CODES(REG_FP[dst]);
+			USE_CYCLES(6);
+			break;
+		}
+		case 0x26:		// FSCALE (pico-mac): dst * 2^int(source)
+		{
+			const sint32 n = floatx80_to_int32_round_to_zero(source);
+			floatx80 d = REG_FP[dst];
+			const int e = d.high & 0x7fff;
+			if (e != 0x7fff && d.low != 0) {
+				const sint32 ne = (sint32)e + n;
+				if (ne >= 0x7fff) {			// overflow: infinity
+					d.high = (d.high & 0x8000) | 0x7fff;
+					d.low = LIT64(0x8000000000000000);
+				} else if (ne <= 0)			// denormal or zero
+					d = double_to_fx80(ldexp(fx80_to_double(d), n));
+				else
+					d.high = (uint16)((d.high & 0x8000) | ne);
+			}
+			REG_FP[dst] = d;
+			SET_CONDITION_CODES(REG_FP[dst]);
+			USE_CYCLES(10);
+			break;
+		}
+		// The other transcendentals (pico-mac), as SIN/COS: through double.
+		case 0x02: case 0x06: case 0x08: case 0x09: case 0x0a: case 0x0c: case 0x0d: case 0x0f:
+		case 0x10: case 0x11: case 0x12: case 0x14: case 0x15: case 0x16: case 0x19: case 0x1c:
+		{
+			const double x = fx80_to_double(source);
+			double r;
+			switch (opmode) {
+				case 0x02: r = sinh(x); break;
+				case 0x06: r = log1p(x); break;
+				case 0x08: r = expm1(x); break;
+				case 0x09: r = tanh(x); break;
+				case 0x0a: r = atan(x); break;
+				case 0x0c: r = asin(x); break;
+				case 0x0d: r = atanh(x); break;
+				case 0x0f: r = tan(x); break;
+				case 0x10: r = exp(x); break;
+				case 0x11: r = exp2(x); break;
+				case 0x12: r = pow(10.0, x); break;
+				case 0x14: r = log(x); break;
+				case 0x15: r = log10(x); break;
+				case 0x16: r = log2(x); break;
+				case 0x19: r = cosh(x); break;
+				default:   r = acos(x); break;
+			}
+			REG_FP[dst] = double_to_fx80(r);
+			SET_CONDITION_CODES(REG_FP[dst]);
+			USE_CYCLES(400);
+			break;
+		}
 		case 0x20:		// FDIV
 		{
 			REG_FP[dst] = floatx80_div(REG_FP[dst], source);

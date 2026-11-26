@@ -542,6 +542,7 @@ let kbdOn = true;
 let padOn = false;                    // 🖱: the trackpad in the keyboard's place
 let gameOn = false;                   // 🎮: the game keyboard in the PC keyboard's place
 let wasLand = null;                   // the last layout's orientation
+let fullOn = false;                   // ⛶ (sideways only): the picture over the whole screen
 function layout() {
   const W = window.innerWidth, H = window.innerHeight;
   // sideways starts with the Mac keyboard hidden (it would cover the screen; ⌨ shows it), the game
@@ -551,7 +552,8 @@ function layout() {
     if (wasLand && !gameOn) kbdOn = false;
     else if (!wasLand && !padOn) kbdOn = true;
   }
-  app.classList.remove('portrait', 'land', 'lgame', 'lkbd');
+  app.classList.remove('portrait', 'land', 'lgame', 'lkbd', 'full');
+  if (H >= W) fullOn = false;           // full screen is for sideways only
   // the screen's box: square for the panel, the Mac picture's own shape for the Mac
   const ar = screenKind === 'pc' ? pcAr : 1;
   app.style.setProperty('--ar', String(ar));
@@ -576,10 +578,12 @@ function layout() {
     app.classList.toggle('lkbd', kbdOn && !gameOn && !padOn);
     app.style.setProperty('--kh', Math.max(26, Math.min(38, H / 11)) + 'px');
     pad = !game;
+    // full screen: the picture alone; a touch on it is the mouse (no trackpad to send it to)
+    if (fullOn) { app.classList.add('full'); pad = false; }
   }
   app.classList.toggle('padmode', pad);
   $('#pad').hidden = !pad;
-  kbd.hidden = !kbdOn || padOn;
+  kbd.hidden = !kbdOn || padOn || fullOn;
   if (kbd.classList.contains('game') !== gameOn) buildKbd();
   $('[data-act=kbd]').classList.toggle('on', kbdOn && !padOn && !gameOn);
   $('[data-act=game]').classList.toggle('on', kbdOn && gameOn && !padOn);
@@ -1172,10 +1176,24 @@ $('#toolbar').addEventListener('click', (e) => {
     case 'kbd': if (padOn || gameOn) { padOn = gameOn = false; kbdOn = true; } else kbdOn = !kbdOn; layout(); break;
     case 'game': gameOn = !(gameOn && kbdOn && !padOn); padOn = false; kbdOn = true; layout(); break;
     case 'files': openFiles(); break;
+    case 'full': setFull(true); break;
     case 'mouse': padOn = !padOn; if (padOn) gameOn = false; else kbdOn = true; layout(); break;   // the trackpad instead of the keyboard
     case 'sound': toggleMute(); break;
   }
 });
+
+// Full screen: the page's own (iPhones' Safari has no Fullscreen API for a page; where there is one,
+// it hides the browser's bars too).
+function setFull(on) {
+  fullOn = on;
+  try {
+    const d = document, el = d.documentElement;
+    if (on && !d.fullscreenElement && el.requestFullscreen) el.requestFullscreen().catch(() => {});
+    if (!on && d.fullscreenElement && d.exitFullscreen) d.exitFullscreen().catch(() => {});
+  } catch (_) {}
+  layout();
+}
+$('#full-exit').addEventListener('click', () => setFull(false));
 
 // ======================= audio =======================
 let actx = null, gain = null, muted = false;

@@ -26,6 +26,10 @@ first.
   ncr5380.h (SCSI, no targets yet), macii_slotrom.h (the card's declaration ROM and its driver,
   which calls the emulator through opcodes 0x7110-0x7114), macii_sony.h (disks: our .Sony,
   patched over the ROM's at power-on, opcodes 0x7120-0x7123; the ROM checksum is recomputed),
+  five drives in this order: Hard disk 1 (boot; settings key disk), Floppy 1 (disk2), Hard disk 2 (hd2),
+  Floppy 2 (floppy2), CD-ROM (cdrom, read-only). Floppies and the CD swap while the Mac runs; a hard disk
+  change restarts it. A floppy is put in place only at the first accRun: in place at power-on, the
+  start-up code ejects it (Control 7) as a non-start-up disk. An old disk2 bigger than a floppy moves to hd2.
   rtc.h (clock + 256-byte XPRAM in picomac/pram2.bin; SPConfig always reads "async": with no SCC,
   AppleTalk hangs the boot), asc.h (the Apple Sound Chip, FIFO and wavetable; its IRQ is VIA2 CB1; 0x804 is read-only and its half/empty bits are levels: the Sound Manager refills only on the half bit, and edge-only flags muted PoP).
   Speed on the P4: macii_iram.h puts the hot 68020 handlers in IRAM (regenerate the list from a
@@ -40,7 +44,7 @@ first.
   Colours: XPRAM 0x46 is slot 9's PRAM (board ID 0x0123, then 0x48 = the start-up mode, spID 0x80-0x83 =
   1-8 bits). System755.dsk has no Monitors panel, so the menu's Colors row writes it and restarts;
   a fresh PRAM starts at 256. MAC_KEYS on the Mac II also takes atXxY, mdown, mup (the pointer).
-  CPU speed (not on the P4): s_speed is in quarters (4 = 1x); the setting 5 = Max, maxSpeedStep holds the frame's work near 11.5 ms (up to 16x). The VIAs stay real time.
+  CPU speed (not on the P4): s_speed is in quarters (4 = 1x); the setting 5 = Max, maxSpeedStep holds the frame's work near 11.5 ms (up to 16x). Max stays at 4x until the first .Sony call (and again after a RESET): above that the ROM's start-up tests fail (the Quadra: a sad Mac at 8x, 32 MB, on an iPhone). The VIAs stay real time.
   Below full speed the core stretches each frame's sound (SoundStretch, from the queued audio, up
   to 25%): without it the P4's DMA ran dry several times a second, a crackle on game sounds.
   The keys are ADB raw codes: the arrows are 0x3B-0x3E (the umac MKC_ ones, 0x7B-0x7E, are the
@@ -61,6 +65,28 @@ first.
   the TC through the old mapping (PLOAD fills the TLB, as the ATC). XPRAM in picomac/pramci.bin.
   Test: MAC_MACHINE=iici MAC_ROM3="picomac/368CADFE - Mac IIci.ROM"; System755.dsk boots to the Finder
   (MAC_KEYS "w40000,enter,..."). -DMACII_PC_HISTORY adds MACII_TRAP=<hex pc> (jump history at that PC).
+- The Quadra 700 (`kMacQuadra`, desktop + web only): macii_core.cpp again with MACII_QUADRA (macquadra_names.h;
+  MACII_PMMU = the TLB bus, shared with the IIci) on a 68040 (m68kcpu040.c/m68kops040.c, m68kconf040.h). Musashi's
+  040 lacks MOVEC's MMU registers, CINV/CPUSH, PFLUSH, PTEST, MOVE16 and the 040 FSAVE frames: macquadra_mmu.h
+  has those handlers and jumpTableToRam puts them over Musashi's. The 040 walk (8 KB pages, ITT/DTT) is in the
+  core's bus. Map: ROM 1 MB at 0x40000000 (420DBFF3), RAM contiguous from 0, I/O 0x50000000 (off>>13: 0 VIA1,
+  1 VIA2, 7 the 53C96 at +0xF000, 10 ASC, 15 SWIM), DAFB 0xF9 reads 0 (no monitor), our card in slot E. 25 MHz.
+  VIA1 PA reads 0xC1 (the box: BoxFlag 16 = Gestalt 22). ncr53c96.h: no targets, a selection times out a few
+  frames later (disconnect, VIA2 CB2); without it SCSI Manager 4.3 polls forever at "Starting up".
+  XPRAM in picomac/pramq700.bin, snapshots in "-macquadra". Test: MAC_MACHINE=quadra
+  MAC_ROM4="picomac/420DBFF3 - Quadra 700&900 & PB140&170.ROM"; System755.dsk boots to the Finder.
+  MAC_RAMDUMP=<file> makes "dump" write the RAM too (desktop), for a disassembler.
+  RAM 4/8/16/32 MB (MAC_RAM=0-3): contiguous, and only a power of two ends the ROM's sizing loop.
+  z8530.h: the SCC at +0xC000 (IRQ level 4), with the transmitters only. Mac OS 8's Open Transport starts
+  LocalTalk whatever SPConfig says and waits for its frames to go out ("Starting up" forever without it).
+  Mac OS 8.1: the CD .iso boots as MAC_DISK (macii_sony.h takes the first Apple_HFS partition of a
+  partitioned image; .iso/.cdr/.toast are read-only). An image bigger than a floppy is a hard disk:
+  qType 1 with its size, Drive Info type 1, and a unit-table entry of its own (the installer refuses
+  volumes on .Sony, refNum -5). A blank file initializes (Format succeeds); sdcard/picomac/MacOS81.dsk
+  (512 MB) holds an 8.1 installed from the CD. Keep it HFS ("Mac OS Standard"): 68K Macs can't start from HFS+.
+  An 8.1 start-up patch (level-1 interrupt) searches for its own code with an ADD.W that loses the carry
+  across a 64 KB boundary and loops forever (16 MB, first extension icon): fixPatchSearch rewrites that loop.
+  MAC_KEYS_FILE=<file> drives a long run step by step (each time the file appears, its text is the next script).
 - web/: the phone version (as pico-386's). web/src/hal_web.cpp (EMU_WEB) replaces the SDL HAL; the cores
   take the page's pointer once a frame (webPointer, EMU_WEB): absolute Mac pixels from the touch screen
   (web_pointer) or trackpad moves (web_mouse), written to the cursor globals. The button's changes are queued
@@ -75,7 +101,7 @@ first.
 - Desktop (MSYS2 MinGW32 + SDL2):
   `MSYSTEM=MINGW32 /c/msys64/usr/bin/bash.exe -lc "cd /c/Users/lucia/repos/pico-mac && cmake -G 'Unix Makefiles' -S . -B build -DCMAKE_BUILD_TYPE=Debug && make -C build -j8"`
   - umac is always built at -O2.
-  - Test hooks: MAC_SD, MAC_DISK, MAC_DISK2 (second drive), MAC_SNAP (start from a .snp), MAC_MACHINE=ii
+  - Test hooks: MAC_SD, MAC_DISK, MAC_DISK2 (second drive; Floppy 1 on the Mac II family), MAC_HD2, MAC_FLOPPY2, MAC_CDROM, MAC_SNAP (start from a .snp), MAC_MACHINE=ii
     (the Mac II core), MAC_ROM2 (its ROM, relative to MAC_SD), MAC_KEYS
     ("w1500,shot,quit"), MAC_SHOT.
 - A hung Mac: "@mac" on the P4 console (COM9, 115200; open it with DTR/RTS off, or the board

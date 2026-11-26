@@ -15,11 +15,11 @@ namespace {
 #if defined(ESP_PLATFORM)
 const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II" };
 #else
-const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II", "Mac IIci" };
+const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II", "Mac IIci", "Quadra 700" };
 #endif
 
 struct Data {
-  std::string name, disk, disk2, snapdir;
+  std::string name, disk, disk2, hd2, floppy2, cdrom, snapdir;
   int machine = MACHINE_PLUS, ram = -1, screen = SCREEN_FIT, speed = 1, speedVer = 0;
 };
 
@@ -52,6 +52,9 @@ bool readData(const std::string &path, Data &d) {
     else if (!strcmp(line, "machine")) d.machine = atoi(v);
     else if (!strcmp(line, "disk")) d.disk = v;
     else if (!strcmp(line, "disk2")) d.disk2 = v;
+    else if (!strcmp(line, "hd2")) d.hd2 = v;
+    else if (!strcmp(line, "floppy2")) d.floppy2 = v;
+    else if (!strcmp(line, "cdrom")) d.cdrom = v;
     else if (!strcmp(line, "ram")) d.ram = atoi(v);
     else if (!strcmp(line, "screen")) d.screen = atoi(v);
     else if (!strcmp(line, "speed")) d.speed = atoi(v);
@@ -74,15 +77,16 @@ bool writeData(const std::string &path, const Data &d) {
   makeDirs(dirPath());
   FILE *f = fopen(path.c_str(), "w");
   if (!f) { hal_log("startups: cannot write %s", path.c_str()); return false; }
-  fprintf(f, "name=%s\nmachine=%d\ndisk=%s\ndisk2=%s\nram=%d\nscreen=%d\nspeed=%d\nspeedver=2\nsnapdir=%s\n",
-          d.name.c_str(), d.machine, d.disk.c_str(), d.disk2.c_str(), d.ram, d.screen, d.speed,
-          d.snapdir.c_str());
+  fprintf(f, "name=%s\nmachine=%d\ndisk=%s\ndisk2=%s\nhd2=%s\nfloppy2=%s\ncdrom=%s\nram=%d\nscreen=%d\nspeed=%d\nspeedver=2\nsnapdir=%s\n",
+          d.name.c_str(), d.machine, d.disk.c_str(), d.disk2.c_str(), d.hd2.c_str(), d.floppy2.c_str(), d.cdrom.c_str(),
+          d.ram, d.screen, d.speed, d.snapdir.c_str());
   fclose(f);
   return true;
 }
 
 int &ramOf(int machine) {
-  return machine == MACHINE_II ? g_settings.ramII : machine == MACHINE_IICI ? g_settings.ramIIci : g_settings.ram;
+  return machine == MACHINE_II ? g_settings.ramII : machine == MACHINE_IICI ? g_settings.ramIIci
+       : machine == MACHINE_QUADRA ? g_settings.ramQuadra : g_settings.ram;
 }
 
 // g_settings -> d (the machine's part; name and snapdir stay).
@@ -90,6 +94,9 @@ void capture(Data &d) {
   d.machine = g_settings.machine;
   d.disk = g_settings.disk;
   d.disk2 = g_settings.disk2;
+  d.hd2 = g_settings.hd2;
+  d.floppy2 = g_settings.floppy2;
+  d.cdrom = g_settings.cdrom;
   d.ram = ramOf(d.machine);
   d.screen = g_settings.screen;
   d.speed = g_settings.speed;
@@ -154,7 +161,8 @@ std::string startup_summary(const std::string &path) {
   std::string s = kMachineNames[d.machine];
   s += "  ";
   s += d.disk.empty() ? std::string("No disk") : fileOf(d.disk);
-  if (!d.disk2.empty()) s += " + " + fileOf(d.disk2);
+  for (const std::string *x : { &d.hd2, &d.disk2, &d.floppy2, &d.cdrom })
+    if (!x->empty() && (d.machine != MACHINE_PLUS || x == &d.disk2)) s += " + " + fileOf(*x);
   return s;
 }
 
@@ -169,6 +177,9 @@ bool startup_open(const std::string &path) {
   s_data = d;
   g_settings.disk = d.disk;
   g_settings.disk2 = d.disk2;
+  g_settings.hd2 = d.hd2;
+  g_settings.floppy2 = d.floppy2;
+  g_settings.cdrom = d.cdrom;
   g_settings.screen = d.screen;
   g_settings.speed = d.speed;
   if (d.ram >= 0) {

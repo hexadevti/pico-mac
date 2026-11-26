@@ -5,6 +5,7 @@
 #ifndef MACIICI_NAMES_H
 #define MACIICI_NAMES_H
 #define MACII_IICI 1
+#define MACII_PMMU 1
 
 #define macii_read8          maciici_read8
 #define macii_read16         maciici_read16

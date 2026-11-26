@@ -18,13 +18,13 @@ int          macii_illegal(int opcode);
 void         macii_instr_hook(unsigned int pc);   /* every instruction (a debugging build only) */
 #endif   /* an illegal instruction: logged; 0 = take the exception */
 
-/* The Mac IIci (MACII_IICI): its 68030's PMMU maps every access, so the fast path is a
+/* The Mac IIci and the Quadra (MACII_PMMU): PMMUs map every access, so the fast path is a
  * translation cache of 4 KB pages, direct-mapped by the logical page number. rtag/wtag hold the
  * logical page (a & ~0xFFF; 1 = empty) whose host bytes are rhost/whost; a write entry is there only
  * once a write has gone through the table walk (it sets the page's M bit). The core empties it on
  * any change of the MMU registers, PFLUSH or the overlay. An access that would cross a page goes
  * the slow way. The fetch window is one cached page. */
-#if defined(MACII_IICI)
+#if defined(MACII_PMMU)
 #define MACIICI_TLB 1024
 typedef struct {
   unsigned int rtag[MACIICI_TLB], wtag[MACIICI_TLB];
@@ -168,7 +168,7 @@ MACII_FAST_INLINE unsigned int macii_fetch32(unsigned int a) {
   return macii_fetch32_slow(a);
 }
 MACII_FAST_INLINE unsigned int macii_fetch8(unsigned int a) { return macii_fetch16(a & ~1u) >> (a & 1 ? 0 : 8) & 0xFF; }
-#endif   /* MACII_IICI */
+#endif   /* MACII_PMMU */
 #ifdef __cplusplus
 }
 #endif

@@ -37,9 +37,11 @@ namespace {
 constexpr char kMagic[8] = { 'P', 'M', 'A', 'C', 'S', 'N', 'P', '1' };
 constexpr char kMagicII[8] = { 'P', 'M', 'I', 'I', 'S', 'N', 'P', '1' };
 constexpr char kMagicIIci[8] = { 'P', 'M', 'I', 'C', 'S', 'N', 'P', '1' };
-bool isII() { return g_settings.machine == MACHINE_II || g_settings.machine == MACHINE_IICI; }
+constexpr char kMagicQuadra[8] = { 'P', 'M', 'Q', '7', 'S', 'N', 'P', '1' };
+bool isII() { return g_settings.machine != MACHINE_PLUS; }
 bool isIIci() { return g_settings.machine == MACHINE_IICI; }
-const char *magic() { return isIIci() ? kMagicIIci : isII() ? kMagicII : kMagic; }
+bool isQuadra() { return g_settings.machine == MACHINE_QUADRA; }
+const char *magic() { return isQuadra() ? kMagicQuadra : isIIci() ? kMagicIIci : isII() ? kMagicII : kMagic; }
 constexpr int kThumbW = 80, kThumbH = 54;
 std::string s_pending;                 // the snapshot mac_loadRom starts from next
 
@@ -55,7 +57,7 @@ constexpr char kHardware[] = "desktop";
 std::string snapDir() {
   const char *own = startup_snapdir();
   const std::string base = *own ? std::string("picomac/") + own : std::string("picomac/snapshots/") + kHardware;
-  return sdPath((base + (isIIci() ? "-maciici" : isII() ? "-macii" : "")).c_str());
+  return sdPath((base + (isQuadra() ? "-macquadra" : isIIci() ? "-maciici" : isII() ? "-macii" : "")).c_str());
 }
 std::string genFile() { return sdPath("picomac/snapshots/disks.gen"); }
 
@@ -115,6 +117,8 @@ bool getStr(FILE *f, std::string &s, size_t max) {
 struct Header {
   std::string name, disk, disk2, rom;   // the paths relative to the card
   uint32_t ram = 0, screen = 0, gen[2] = { 0, 0 };
+  std::string hd2, floppy2, cdrom;      // the Mac II family only: after gen, with gen2
+  uint32_t gen2[2] = { 0, 0 };
 };
 
 // Reads the header; f is left at the machine state.
@@ -123,7 +127,8 @@ bool readHeader(FILE *f, Header &h, bool nameOnly) {
   if (!get(f, mg, 8) || memcmp(mg, magic(), 8) || !getStr(f, h.name, 200)) return false;
   if (nameOnly) return true;
   return getStr(f, h.disk, 300) && getStr(f, h.disk2, 300) && getStr(f, h.rom, 300) && get(f, &h.ram, 4) &&
-         get(f, &h.screen, 4) && get(f, h.gen, sizeof h.gen);
+         get(f, &h.screen, 4) && get(f, h.gen, sizeof h.gen) &&
+         (!isII() || (getStr(f, h.hd2, 300) && getStr(f, h.floppy2, 300) && getStr(f, h.cdrom, 300) && get(f, h.gen2, sizeof h.gen2)));
 }
 
 bool readHeaderOf(const std::string &snap, Header &h) {
@@ -299,11 +304,17 @@ const char *macsnap_save(const std::string &name, const std::string &replace, co
   hd.screen = (uint32_t)m.screen;
   hd.gen[0] = hd.disk.empty() ? 0 : genOf(hd.disk);
   hd.gen[1] = hd.disk2.empty() ? 0 : genOf(hd.disk2);
+  hd.hd2 = relOf(m.hd2);
+  hd.floppy2 = relOf(m.floppy2);
+  hd.cdrom = relOf(m.cdrom);
+  hd.gen2[0] = hd.hd2.empty() ? 0 : genOf(hd.hd2);
+  hd.gen2[1] = hd.floppy2.empty() ? 0 : genOf(hd.floppy2);
 
   FILE *f = fopen(path.c_str(), "wb");
   if (!f) return "Cannot write the snapshot";
   bool ok = put(f, magic(), 8) && putStr(f, hd.name) && putStr(f, hd.disk) && putStr(f, hd.disk2) &&
             putStr(f, hd.rom) && put(f, &hd.ram, 4) && put(f, &hd.screen, 4) && put(f, hd.gen, sizeof hd.gen);
+  if (isII()) ok = ok && putStr(f, hd.hd2) && putStr(f, hd.floppy2) && putStr(f, hd.cdrom) && put(f, hd.gen2, sizeof hd.gen2);
   ok = ok && state(f);
   if (fclose(f) != 0) ok = false;
   if (!ok) {
@@ -328,6 +339,9 @@ bool macsnap_machine(const std::string &snap, MacSnapMachine &m) {
   if (!readHeaderOf(snap, h) || h.ram >= (uint32_t)(isII() ? RAM2_COUNT : RAM_COUNT) || h.screen >= SCREEN_COUNT) return false;
   m.disk = fullOf(h.disk);
   m.disk2 = fullOf(h.disk2);
+  m.hd2 = fullOf(h.hd2);
+  m.floppy2 = fullOf(h.floppy2);
+  m.cdrom = fullOf(h.cdrom);
   m.rom = h.rom;
   m.ram = (int)h.ram;
   m.screen = (int)h.screen;
@@ -337,7 +351,8 @@ bool macsnap_machine(const std::string &snap, MacSnapMachine &m) {
 bool macsnap_disks_changed(const std::string &snap) {
   Header h;
   if (!readHeaderOf(snap, h)) return false;
-  return (!h.disk.empty() && genOf(h.disk) != h.gen[0]) || (!h.disk2.empty() && genOf(h.disk2) != h.gen[1]);
+  return (!h.disk.empty() && genOf(h.disk) != h.gen[0]) || (!h.disk2.empty() && genOf(h.disk2) != h.gen[1]) ||
+         (!h.hd2.empty() && genOf(h.hd2) != h.gen2[0]) || (!h.floppy2.empty() && genOf(h.floppy2) != h.gen2[1]);
 }
 
 const char *macsnap_restore(const std::string &snap, bool *broken, MacSnapRead state) {
