@@ -550,6 +550,7 @@ void app_loop() {
     else if (g_settings.machine == MACHINE_II) g_settings.ramII = r;
     else g_settings.ram = r;
   }
+  if (const char *v = getenv("MAC_SPEED")) g_settings.speed = atoi(v);                 // test hook: 1-5 (5 = Max)
   if (const char *snap = getenv("MAC_SNAP")) {                                        // test hook: start from it
     macsnap_set_pending(snap);
     runMachine(machineCore(), g_settings.disk);

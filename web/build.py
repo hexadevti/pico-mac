@@ -81,14 +81,30 @@ def obj_for(src):
     return os.path.join(OBJ, rel + ".o")
 
 
+def up_to_date(obj, src):
+    """The object is newer than its source and every file it included (its .d file)."""
+    dep = obj + ".d"
+    if not os.path.exists(obj) or not os.path.exists(dep):
+        return False
+    t = os.path.getmtime(obj)
+    with open(dep, encoding="utf-8", errors="replace") as f:
+        text = f.read().replace("\\\n", " ")
+    files = text.split(": ", 1)[1].split() if ": " in text else []
+    for d in [src] + files:
+        if not os.path.exists(d) or os.path.getmtime(d) > t:
+            return False
+    return True
+
+
 def compile_one(src):
     obj = obj_for(src)
-    if os.path.exists(obj) and os.path.getmtime(obj) >= os.path.getmtime(src) and not os.environ.get("FORCE"):
+    if not os.environ.get("FORCE") and up_to_date(obj, src):
         return obj, None
+    dep = ["-MMD", "-MF", obj + ".d"]   # the headers and included sources (macquadra_core.cpp includes macii_core.cpp)
     if src.endswith(".c"):
-        cmd = [EMCC, "-c", src, "-o", obj] + CFLAGS
+        cmd = [EMCC, "-c", src, "-o", obj] + CFLAGS + dep
     else:
-        cmd = [EMXX, "-c", src, "-o", obj] + CXXFLAGS
+        cmd = [EMXX, "-c", src, "-o", obj] + CXXFLAGS + dep
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return obj, f"--- {src}\n{r.stdout}{r.stderr}"
