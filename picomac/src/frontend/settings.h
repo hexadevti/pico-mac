@@ -9,12 +9,12 @@
 enum { SCREEN_FIT, SCREEN_PAN, SCREEN_NATIVE, SCREEN_COUNT };
 // RAM sizes in KB
 enum { RAM_512K, RAM_1M, RAM_2M, RAM_4M, RAM_COUNT };
-// The machine the home menu starts (the IIci: not on the P4), and the Mac II's RAM sizes (the
-// IIci's four are 4, 8, 16 and 32 MB).
+// The machine the home menu starts (the IIci and the Quadra: not on the P4), and the Mac II's RAM
+// sizes (the IIci's four are 4, 8, 16 and 32 MB, the Quadra 700's 4, 8, 20 and 36).
 #if defined(ESP_PLATFORM)
-enum { MACHINE_PLUS, MACHINE_II, MACHINE_COUNT, MACHINE_IICI = -1 };
+enum { MACHINE_PLUS, MACHINE_II, MACHINE_COUNT, MACHINE_IICI = -1, MACHINE_QUADRA = -2 };
 #else
-enum { MACHINE_PLUS, MACHINE_II, MACHINE_IICI, MACHINE_COUNT };
+enum { MACHINE_PLUS, MACHINE_II, MACHINE_IICI, MACHINE_QUADRA, MACHINE_COUNT };
 #endif
 enum { RAM2_1M, RAM2_2M, RAM2_4M, RAM2_8M, RAM2_COUNT };
 
@@ -34,6 +34,8 @@ struct Settings {
   int ramII = RAM2_4M;
   std::string romPathIIci = "picomac/maciici.rom";   // the Mac IIci's ROM
   int ramIIci = 1;           // 8 MB
+  std::string romPathQuadra = "picomac/macquadra.rom";   // the Quadra 700's ROM
+  int ramQuadra = 1;         // 8 MB
   std::string startup;       // the startup last chosen (its file in /picomac/startups)
 };
 

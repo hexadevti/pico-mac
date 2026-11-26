@@ -89,6 +89,11 @@ Changes:
     operand (exponent set, integer bit clear) before the operation, as the 68881 does. Softfloat
     assumes normal operands: floatx80_div's correction loop ran ~2^63/significand times, and
     SimCity 2000's power grid froze the Mac II for minutes.
+  - **The missing FPU opmodes** (m68kfpu_inc.h): `fpgen_rm_reg` stopped with a fatal error on
+    FSCALE, FGETMAN and most transcendentals (Mac OS 8.1's start-up runs FSCALE on the Quadra).
+    FSCALE and FGETMAN now work on the extended value directly. FSINH, FLOGNP1, FETOXM1, FTANH,
+    FATAN, FASIN, FATANH, FTAN, FETOX, FTWOTOX, FTENTOX, FLOGN, FLOG10, FLOG2, FCOSH and FACOS go
+    through double and math.h, as upstream's FSIN/FCOS already do.
   - **M68K_FIXED_CPU_API** (m68kcpu.c): with a fixed CPU type, `m68k_set_cpu_type` asserts against
     this API value when it is defined, because `CPU_TYPE_020` (internal) differs from
     `M68K_CPU_TYPE_68020` (the API).
@@ -135,6 +140,18 @@ m68kconf030.h (a fixed `CPU_TYPE_030`, the FPU, `HAS_PMMU`, and `M68K_MMU_HEADER
 and m68k030_names.h for the symbols (`m68k030_*`). maciici_core.cpp compiles macii_core.cpp again
 with `MACII_IICI` and maciici_names.h, so the IIci core is the Mac II's with its own memory map
 (the RBV in place of VIA2, two RAM banks, the video card in slot E) and the MMU.
+
+### The 68040 build (picomac/src/mac2/m68k*040*, the Quadra 700; not on the P4)
+
+A fourth compile: m68kcpu040.c and m68kops040.c with m68kconf040.h (a fixed `CPU_TYPE_040`, the
+FPU, and `M68K_MMU_HEADER` = macquadra_mmu.h) and m68k040_names.h (`m68k040_*`). No umac source
+changes beyond the FPU opmodes above: Musashi's 040 lacks MOVEC's MMU registers, CINV/CPUSH, PFLUSH, PTEST, most MOVE16 forms
+and the 040's FSAVE frames, so macquadra_mmu.h holds new handlers for them, which the core puts in
+its dispatch table over Musashi's. macquadra_core.cpp compiles macii_core.cpp with `MACII_QUADRA`
+(macquadra_names.h): the Quadra's map, the 040 table walk in the core's bus, and ncr53c96.h (the
+53C96 SCSI controller, new code, after the register descriptions in the NCR data sheet and MAME's
+ncr53c90.cpp; no MAME code is copied) and z8530.h (the SCC, new code after Zilog's data sheet:
+the transmitters only, on an empty bus).
 
 adb.h, ncr5380.h, rtc.h (the clock and XPRAM) and macii_slotrom.h (the card's declaration ROM and
 its driver) are new code written for pico-mac, not taken from other projects. asc.h (the Apple Sound

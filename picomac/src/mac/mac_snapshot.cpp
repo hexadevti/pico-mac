@@ -37,9 +37,11 @@ namespace {
 constexpr char kMagic[8] = { 'P', 'M', 'A', 'C', 'S', 'N', 'P', '1' };
 constexpr char kMagicII[8] = { 'P', 'M', 'I', 'I', 'S', 'N', 'P', '1' };
 constexpr char kMagicIIci[8] = { 'P', 'M', 'I', 'C', 'S', 'N', 'P', '1' };
-bool isII() { return g_settings.machine == MACHINE_II || g_settings.machine == MACHINE_IICI; }
+constexpr char kMagicQuadra[8] = { 'P', 'M', 'Q', '7', 'S', 'N', 'P', '1' };
+bool isII() { return g_settings.machine != MACHINE_PLUS; }
 bool isIIci() { return g_settings.machine == MACHINE_IICI; }
-const char *magic() { return isIIci() ? kMagicIIci : isII() ? kMagicII : kMagic; }
+bool isQuadra() { return g_settings.machine == MACHINE_QUADRA; }
+const char *magic() { return isQuadra() ? kMagicQuadra : isIIci() ? kMagicIIci : isII() ? kMagicII : kMagic; }
 constexpr int kThumbW = 80, kThumbH = 54;
 std::string s_pending;                 // the snapshot mac_loadRom starts from next
 
@@ -55,7 +57,7 @@ constexpr char kHardware[] = "desktop";
 std::string snapDir() {
   const char *own = startup_snapdir();
   const std::string base = *own ? std::string("picomac/") + own : std::string("picomac/snapshots/") + kHardware;
-  return sdPath((base + (isIIci() ? "-maciici" : isII() ? "-macii" : "")).c_str());
+  return sdPath((base + (isQuadra() ? "-macquadra" : isIIci() ? "-maciici" : isII() ? "-macii" : "")).c_str());
 }
 std::string genFile() { return sdPath("picomac/snapshots/disks.gen"); }
 

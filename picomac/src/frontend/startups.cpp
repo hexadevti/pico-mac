@@ -15,7 +15,7 @@ namespace {
 #if defined(ESP_PLATFORM)
 const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II" };
 #else
-const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II", "Mac IIci" };
+const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II", "Mac IIci", "Quadra 700" };
 #endif
 
 struct Data {
@@ -82,7 +82,8 @@ bool writeData(const std::string &path, const Data &d) {
 }
 
 int &ramOf(int machine) {
-  return machine == MACHINE_II ? g_settings.ramII : machine == MACHINE_IICI ? g_settings.ramIIci : g_settings.ram;
+  return machine == MACHINE_II ? g_settings.ramII : machine == MACHINE_IICI ? g_settings.ramIIci
+       : machine == MACHINE_QUADRA ? g_settings.ramQuadra : g_settings.ram;
 }
 
 // g_settings -> d (the machine's part; name and snapdir stay).

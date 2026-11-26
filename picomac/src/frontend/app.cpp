@@ -25,7 +25,8 @@ extern const EmuCore kMacPlus;
 extern const EmuCore kMacII;
 #if !defined(ESP_PLATFORM)
 extern const EmuCore kMacIIci;   // the 68030 Mac: desktop and web only
-const EmuCore *const kCores[] = { &kMacPlus, &kMacII, &kMacIIci };
+extern const EmuCore kMacQuadra; // the 68040 Mac: desktop and web only
+const EmuCore *const kCores[] = { &kMacPlus, &kMacII, &kMacIIci, &kMacQuadra };
 #else
 const EmuCore *const kCores[] = { &kMacPlus, &kMacII };
 #endif
@@ -216,40 +217,45 @@ static void runMachine(const EmuCore &core, const std::string &disk) {
 // The machine the home menu starts.
 #if !defined(ESP_PLATFORM)
 static const EmuCore &machineCore() {
-  return g_settings.machine == MACHINE_II ? kMacII : g_settings.machine == MACHINE_IICI ? kMacIIci : kMacPlus;
+  return g_settings.machine == MACHINE_II ? kMacII : g_settings.machine == MACHINE_IICI ? kMacIIci
+       : g_settings.machine == MACHINE_QUADRA ? kMacQuadra : kMacPlus;
 }
-static const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II", "Mac IIci" };
+static const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II", "Mac IIci", "Quadra 700" };
 #else
 static const EmuCore &machineCore() { return g_settings.machine == MACHINE_II ? kMacII : kMacPlus; }
 static const char *const kMachineNames[MACHINE_COUNT] = { "Mac Plus", "Mac II" };
 #endif
 static const char *const kRam2Names[RAM2_COUNT] = { "1 MB", "2 MB", "4 MB", "8 MB" };
 static const char *const kRam3Names[RAM2_COUNT] = { "4 MB", "8 MB", "16 MB", "32 MB" };   // the IIci's
+static const char *const kRam4Names[RAM2_COUNT] = { "4 MB", "8 MB", "16 MB", "32 MB" };   // the Quadra's
 
 // The current machine's ROM path and (for the Mac IIs) its RAM index.
 static std::string &romPathOf() {
   return g_settings.machine == MACHINE_II ? g_settings.romPathII
-       : g_settings.machine == MACHINE_IICI ? g_settings.romPathIIci : g_settings.romPath;
+       : g_settings.machine == MACHINE_IICI ? g_settings.romPathIIci
+       : g_settings.machine == MACHINE_QUADRA ? g_settings.romPathQuadra : g_settings.romPath;
 }
 
 // The ROM: any 128 KB file for the Plus (mac_core checks it is a Plus v3 when the Mac starts),
-// 256 KB for the Mac II, 512 KB for the IIci.
+// 256 KB for the Mac II, 512 KB for the IIci, 1 MB for the Quadra.
 static bool acceptRom(const std::string &path, std::string &tag) {
   FILE *f = fopen(path.c_str(), "rb");
   if (!f) return false;
   fseek(f, 0, SEEK_END);
   const long n = ftell(f);
   fclose(f);
-  const int kb = g_settings.machine == MACHINE_II ? 256 : g_settings.machine == MACHINE_IICI ? 512 : 128;
+  const int kb = g_settings.machine == MACHINE_II ? 256 : g_settings.machine == MACHINE_IICI ? 512
+               : g_settings.machine == MACHINE_QUADRA ? 1024 : 128;
   if (n != kb * 1024) return false;
-  tag = kb == 512 ? "512K" : kb == 256 ? "256K" : "128K";
+  tag = kb == 1024 ? "1M" : kb == 512 ? "512K" : kb == 256 ? "256K" : "128K";
   return true;
 }
 
 static void chooseRom() {
   BrowseOpts o;
   o.title = g_settings.machine == MACHINE_II ? "Choose the Mac II ROM"
-          : g_settings.machine == MACHINE_IICI ? "Choose the Mac IIci ROM" : "Choose the Mac Plus ROM";
+          : g_settings.machine == MACHINE_IICI ? "Choose the Mac IIci ROM"
+          : g_settings.machine == MACHINE_QUADRA ? "Choose the Quadra 700 ROM" : "Choose the Mac Plus ROM";
   o.accept = acceptRom;
   o.exts = ".rom.bin";
   const std::string start = sdPath("picomac");
@@ -303,8 +309,8 @@ static bool startupScreen(const std::string &path, bool canDelete) {
     ui::Item items[16];
     int kind[16];
     int n = 0;
-    const bool ii = g_settings.machine == MACHINE_II || g_settings.machine == MACHINE_IICI;   // the colour Macs
-    const bool iici = g_settings.machine == MACHINE_IICI;
+    const bool ii = g_settings.machine != MACHINE_PLUS;   // the colour Macs
+    const bool iici = g_settings.machine == MACHINE_IICI, quadra = g_settings.machine == MACHINE_QUADRA;
     const char *disk1Label = ii ? "Hard disk" : "Boot disk";
     const char *disk2Label = ii ? "Floppy" : "Second disk";
     const std::string diskName = macdrives::fileName(g_settings.disk), disk2Name = macdrives::fileName(g_settings.disk2);
@@ -328,7 +334,7 @@ static bool startupScreen(const std::string &path, bool canDelete) {
     items[n] = { disk1Label, diskName.c_str(), ui::ICON_SAVE }; kind[n++] = S_DISK;
     items[n] = { disk2Label, disk2Name.c_str(), ui::ICON_LOAD }; kind[n++] = S_DISK2;
     items[n] = { "ROM", romShown.c_str(), ui::ICON_CART, "Shared by this machine's startups" }; kind[n++] = S_ROM;
-    items[n] = { "RAM", iici ? kRam3Names[g_settings.ramIIci] : ii ? kRam2Names[g_settings.ramII] : kRamNames[g_settings.ram], ui::ICON_GEAR, nullptr, -1, true }; kind[n++] = S_RAM;
+    items[n] = { "RAM", quadra ? kRam4Names[g_settings.ramQuadra] : iici ? kRam3Names[g_settings.ramIIci] : ii ? kRam2Names[g_settings.ramII] : kRamNames[g_settings.ram], ui::ICON_GEAR, nullptr, -1, true }; kind[n++] = S_RAM;
 #if !defined(EMU_WEB)   // the page shows the Mac's own picture, never the panel's
     // The Mac II has Fit and 1:1 pan only (its Fit is 320x240 in colour).
     items[n] = { "Screen", ii ? (g_settings.screen == SCREEN_PAN ? "1:1 pan" : "Fit 320x240") : kScreenNames[g_settings.screen],
@@ -377,7 +383,8 @@ static bool startupScreen(const std::string &path, bool canDelete) {
       case S_ROM: if (k == KEY_ENTER) chooseRom(); break;
       case S_RAM:
         if (!change) break;
-        if (iici) g_settings.ramIIci = (g_settings.ramIIci + d + RAM2_COUNT) % RAM2_COUNT;
+        if (quadra) g_settings.ramQuadra = (g_settings.ramQuadra + d + RAM2_COUNT) % RAM2_COUNT;
+        else if (iici) g_settings.ramIIci = (g_settings.ramIIci + d + RAM2_COUNT) % RAM2_COUNT;
         else if (ii) g_settings.ramII = (g_settings.ramII + d + RAM2_COUNT) % RAM2_COUNT;
         else g_settings.ram = (g_settings.ram + d + RAM_COUNT) % RAM_COUNT;
         settingsSave();
@@ -516,11 +523,20 @@ void app_loop() {
     for (;;) ui::waitKey();   // its hotkeys still reach the loader / restart
   }
 #if defined(BOARD_DESKTOP)
-  if (const char *m = getenv("MAC_MACHINE"))                                          // test hook: "ii", "iici" or "plus"
-    settingsSetMachine(!strcmp(m, "ii") ? MACHINE_II : !strcmp(m, "iici") ? MACHINE_IICI : MACHINE_PLUS);
+  if (const char *m = getenv("MAC_MACHINE"))                                          // test hook: "ii", "iici", "quadra" or "plus"
+    settingsSetMachine(!strcmp(m, "ii") ? MACHINE_II : !strcmp(m, "iici") ? MACHINE_IICI
+                       : !strcmp(m, "quadra") ? MACHINE_QUADRA : MACHINE_PLUS);
   if (const char *disk2 = getenv("MAC_DISK2")) g_settings.disk2 = disk2;              // test hook
   if (const char *rom = getenv("MAC_ROM2")) g_settings.romPathII = rom;               // test hook (relative to the card)
   if (const char *rom = getenv("MAC_ROM3")) g_settings.romPathIIci = rom;             // test hook: the IIci's
+  if (const char *rom = getenv("MAC_ROM4")) g_settings.romPathQuadra = rom;           // test hook: the Quadra's
+  if (const char *ram = getenv("MAC_RAM")) {                                         // test hook: the RAM row's index
+    const int r = atoi(ram);
+    if (g_settings.machine == MACHINE_QUADRA) g_settings.ramQuadra = r;
+    else if (g_settings.machine == MACHINE_IICI) g_settings.ramIIci = r;
+    else if (g_settings.machine == MACHINE_II) g_settings.ramII = r;
+    else g_settings.ram = r;
+  }
   if (const char *snap = getenv("MAC_SNAP")) {                                        // test hook: start from it
     macsnap_set_pending(snap);
     runMachine(machineCore(), g_settings.disk);

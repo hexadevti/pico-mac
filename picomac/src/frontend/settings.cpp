@@ -43,7 +43,7 @@ static PerMachine s_per[MACHINE_COUNT];
 #if defined(ESP_PLATFORM)
 static const char *const kSuffix[MACHINE_COUNT] = { "", "_ii" };
 #else
-static const char *const kSuffix[MACHINE_COUNT] = { "", "_ii", "_iici" };
+static const char *const kSuffix[MACHINE_COUNT] = { "", "_ii", "_iici", "_quadra" };
 #endif
 
 static void keepCurrent() {
@@ -69,6 +69,7 @@ static int machineKey(char *key) {
   const size_t n = strlen(key);
 #if !defined(ESP_PLATFORM)
   if (n > 5 && !strcmp(key + n - 5, "_iici")) { key[n - 5] = 0; return MACHINE_IICI; }
+  if (n > 7 && !strcmp(key + n - 7, "_quadra")) { key[n - 7] = 0; return MACHINE_QUADRA; }
 #endif
   if (n > 3 && !strcmp(key + n - 3, "_ii")) { key[n - 3] = 0; return MACHINE_II; }
   return MACHINE_PLUS;
@@ -109,6 +110,8 @@ void settingsLoad() {
     else if (!strcmp(line, "ram2"))     g_settings.ramII = atoi(v);
     else if (!strcmp(line, "rom3"))     g_settings.romPathIIci = v;
     else if (!strcmp(line, "ram3"))     g_settings.ramIIci = atoi(v);
+    else if (!strcmp(line, "rom4"))     g_settings.romPathQuadra = v;
+    else if (!strcmp(line, "ram4"))     g_settings.ramQuadra = atoi(v);
     else if (!strcmp(line, "startup"))  g_settings.startup = v;
   }
   fclose(f);
@@ -123,10 +126,12 @@ void settingsLoad() {
   if (g_settings.machine < 0 || g_settings.machine >= MACHINE_COUNT) g_settings.machine = MACHINE_PLUS;
   if (g_settings.ramII < 0 || g_settings.ramII >= RAM2_COUNT) g_settings.ramII = RAM2_4M;
   if (g_settings.ramIIci < 0 || g_settings.ramIIci >= RAM2_COUNT) g_settings.ramIIci = 1;
+  if (g_settings.ramQuadra < 0 || g_settings.ramQuadra >= RAM2_COUNT) g_settings.ramQuadra = 1;
   useMachine(g_settings.machine);
   while (!g_settings.romPath.empty() && g_settings.romPath[0] == '/') g_settings.romPath.erase(0, 1);
   while (!g_settings.romPathII.empty() && g_settings.romPathII[0] == '/') g_settings.romPathII.erase(0, 1);
   while (!g_settings.romPathIIci.empty() && g_settings.romPathIIci[0] == '/') g_settings.romPathIIci.erase(0, 1);
+  while (!g_settings.romPathQuadra.empty() && g_settings.romPathQuadra[0] == '/') g_settings.romPathQuadra.erase(0, 1);
 }
 
 void settingsSave() {
@@ -139,6 +144,7 @@ void settingsSave() {
           g_settings.romPath.c_str(), g_settings.ram, g_settings.arrows,
           g_settings.machine, g_settings.romPathII.c_str(), g_settings.ramII);
   fprintf(f, "rom3=%s\nram3=%d\n", g_settings.romPathIIci.c_str(), g_settings.ramIIci);
+  fprintf(f, "rom4=%s\nram4=%d\n", g_settings.romPathQuadra.c_str(), g_settings.ramQuadra);
   for (int m = 0; m < MACHINE_COUNT; m++)
     fprintf(f, "disk%s=%s\ndisk2%s=%s\nscreen%s=%d\nspeed%s=%d\n", kSuffix[m], s_per[m].disk.c_str(),
             kSuffix[m], s_per[m].disk2.c_str(), kSuffix[m], s_per[m].screen, kSuffix[m], s_per[m].speed);

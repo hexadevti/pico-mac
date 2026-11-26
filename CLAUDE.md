@@ -61,6 +61,26 @@ first.
   the TC through the old mapping (PLOAD fills the TLB, as the ATC). XPRAM in picomac/pramci.bin.
   Test: MAC_MACHINE=iici MAC_ROM3="picomac/368CADFE - Mac IIci.ROM"; System755.dsk boots to the Finder
   (MAC_KEYS "w40000,enter,..."). -DMACII_PC_HISTORY adds MACII_TRAP=<hex pc> (jump history at that PC).
+- The Quadra 700 (`kMacQuadra`, desktop + web only): macii_core.cpp again with MACII_QUADRA (macquadra_names.h;
+  MACII_PMMU = the TLB bus, shared with the IIci) on a 68040 (m68kcpu040.c/m68kops040.c, m68kconf040.h). Musashi's
+  040 lacks MOVEC's MMU registers, CINV/CPUSH, PFLUSH, PTEST, MOVE16 and the 040 FSAVE frames: macquadra_mmu.h
+  has those handlers and jumpTableToRam puts them over Musashi's. The 040 walk (8 KB pages, ITT/DTT) is in the
+  core's bus. Map: ROM 1 MB at 0x40000000 (420DBFF3), RAM contiguous from 0, I/O 0x50000000 (off>>13: 0 VIA1,
+  1 VIA2, 7 the 53C96 at +0xF000, 10 ASC, 15 SWIM), DAFB 0xF9 reads 0 (no monitor), our card in slot E. 25 MHz.
+  VIA1 PA reads 0xC1 (the box: BoxFlag 16 = Gestalt 22). ncr53c96.h: no targets, a selection times out a few
+  frames later (disconnect, VIA2 CB2); without it SCSI Manager 4.3 polls forever at "Starting up".
+  XPRAM in picomac/pramq700.bin, snapshots in "-macquadra". Test: MAC_MACHINE=quadra
+  MAC_ROM4="picomac/420DBFF3 - Quadra 700&900 & PB140&170.ROM"; System755.dsk boots to the Finder.
+  MAC_RAMDUMP=<file> makes "dump" write the RAM too (desktop), for a disassembler.
+  RAM 4/8/16/32 MB (MAC_RAM=0-3): contiguous, and only a power of two ends the ROM's sizing loop.
+  z8530.h: the SCC at +0xC000 (IRQ level 4), with the transmitters only. Mac OS 8's Open Transport starts
+  LocalTalk whatever SPConfig says and waits for its frames to go out ("Starting up" forever without it).
+  Mac OS 8.1: the CD .iso boots as MAC_DISK (macii_sony.h takes the first Apple_HFS partition of a
+  partitioned image; .iso/.cdr/.toast are read-only). An image bigger than a floppy is a hard disk:
+  qType 1 with its size, Drive Info type 1, and a unit-table entry of its own (the installer refuses
+  volumes on .Sony, refNum -5). A blank file initializes (Format succeeds); sdcard/picomac/MacOS81.dsk
+  (512 MB) holds an 8.1 installed from the CD. Keep it HFS ("Mac OS Standard"): 68K Macs can't start from HFS+.
+  MAC_KEYS_FILE=<file> drives a long run step by step (each time the file appears, its text is the next script).
 - web/: the phone version (as pico-386's). web/src/hal_web.cpp (EMU_WEB) replaces the SDL HAL; the cores
   take the page's pointer once a frame (webPointer, EMU_WEB): absolute Mac pixels from the touch screen
   (web_pointer) or trackpad moves (web_mouse), written to the cursor globals. The button's changes are queued

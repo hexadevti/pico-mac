@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 namespace sony {
 
@@ -26,10 +27,11 @@ const uint16_t kDriver[] = {
   0x6F00, 0x0000, 0x0000, 0x0000,   // flags: read, write, control, status, needs time, locked
   24 + 2 * 0, 24 + 2 * 31, 24 + 2 * 33, 24 + 2 * 52, 24 + 2 * 71,   // Open Prime Control Status Close
   0x052E, 0x536F, 0x6E79,           // "\p.Sony"
-  // 0 Open: one drive per index (d3); kOpOpen returns its number in d0, or 0 = no more.
+  // 0 Open: one drive per index (d3); kOpOpen returns its number in d0's high word and its
+  // driver's refNum in the low one, or 0 = no more.
   0x48E7, 0x10F0,                   //  0 movem.l d3/a0-a3,-(sp)
   0x7600,                           //  2 moveq   #0,d3
-  0x701E,                           //  3 moveq   #30,d0          the drive status record
+  0x7064,                           //  3 moveq   #100,d0         the drive status record (+ a DCE)
   0xA71E,                           //  4 _NewPtrSysClear
   0x2208,                           //  5 move.l  a0,d1
   0x6728,                           //  6 beq.s   Fail (27)
@@ -39,8 +41,8 @@ const uint16_t kDriver[] = {
   kOpOpen,                          // 12                         a2 = the record, d1 = index
   0x4A80,                           // 13 tst.l   d0
   0x6F10,                           // 14 ble.s   Done (23)
-  0x4840,                           // 15 swap    d0              the drive number, high word
-  0x303C, 0xFFFB,                   // 16 move.w  #-5,d0          .Sony's refNum
+  0x4E71,                           // 15 nop
+  0x4E71, 0x4E71,                   // 16 nop, nop
   0x41EA, 0x0006,                   // 18 lea     6(a2),a0        the drive queue element
   0xA04E,                           // 20 _AddDrive
   0x5283,                           // 21 addq.l  #1,d3
@@ -150,6 +152,29 @@ struct Image {
       offset = 84;
       data = be32(h + 0x40);
     }
+    // A partitioned image (a CD, a hard disk): the first Apple_HFS partition.
+    uint8_t pm[512];
+    if (!offset && !fseek(f, 0, SEEK_SET) && fread(pm, 1, 2, f) == 2 && pm[0] == 'E' && pm[1] == 'R') {
+      uint32_t count = 1;
+      for (uint32_t i = 1; i <= count && i < 256; i++) {
+        if (fseek(f, (long)(i * 512), SEEK_SET) || fread(pm, 1, 512, f) != 512 || pm[0] != 'P' || pm[1] != 'M') break;
+        count = be32(pm + 4);
+        if (!memcmp(pm + 48, "Apple_HFS", 10)) {
+          offset = be32(pm + 8) * 512;
+          data = be32(pm + 12) * 512;
+          break;
+        }
+      }
+    }
+    // A CD image stays read-only (the Finder would write its desktop files there).
+    const size_t pl = strlen(path);
+    const char *ext = pl > 4 ? path + pl - 4 : "";
+    if (!readOnly && (!strcasecmp(ext, ".iso") || !strcasecmp(ext, ".cdr") || (pl > 6 && !strcasecmp(path + pl - 6, ".toast")))) {
+      fclose(f);
+      f = fopen(path, "rb");
+      readOnly = true;
+      if (!f) { snprintf(err, errLen, "Cannot open the disk"); return false; }
+    }
     if (data < 400 * 1024 || (data & 511)) {
       snprintf(err, errLen, "Not a Mac disk image (%ld bytes)", n);
       close();
@@ -215,10 +240,11 @@ class Drives {
 
  private:
   // Basilisk's constants (b2_macos_util.h)
+  static constexpr uint32_t kFloppyMax = 1440 * 1024;   // bigger: a hard disk (the installers want one)
   enum { qLink = 0, qHead = 2, ioTrap = 6, ioVRefNum = 22, ioBuffer = 32, ioReqCount = 36, ioActCount = 40,
          csCode = 26, csParam = 28, dsWriteProt = 2, dsDiskInPlace = 3, dsInstalled = 4, dsSides = 5,
-         dsQLink = 6, dsQType = 10, dsQDrive = 12, dsTwoSideFmt = 18, dsMFMDrive = 22, dsMFMDisk = 23,
-         dCtlQHdr = 6, dCtlPosition = 16, aRdCmd = 2 };
+         dsQLink = 6, dsQType = 10, dsQDrive = 12, dsTwoSideFmt = 18, dsMFMDrive = 22, dsMFMDisk = 23, dsQDrvSz = 18, dsQDrvSz2 = 20,
+         dCtlDriver = 0, dCtlFlags = 4, dCtlQHdr = 6, dCtlPosition = 16, dCtlRefNum = 24, aRdCmd = 2 };
   enum : int16_t { noErr = 0, controlErr = -17, statusErr = -18, wPrErr = -44, paramErr = -50,
                    nsDrvErr = -56, offLinErr = -65, ioErr = -36 };
 
@@ -257,16 +283,43 @@ class Drives {
     d.num = num;
     d.status = st;
     const Image &im = image[index];
-    bus_.wr16(st + dsQType, 0);                     // sony
     bus_.wr8(st + dsInstalled, 1);
     bus_.wr8(st + dsSides, 0xFF);
-    bus_.wr8(st + dsTwoSideFmt, 0xFF);
-    bus_.wr8(st + dsMFMDrive, 0);
-    bus_.wr8(st + dsMFMDisk, 0);
+    if (im.size > kFloppyMax) {                     // a hard disk: qType 1, the size in blocks
+      bus_.wr16(st + dsQType, 1);
+      bus_.wr16(st + dsQDrvSz, (uint16_t)(im.size / 512));
+      bus_.wr16(st + dsQDrvSz2, (uint16_t)((im.size / 512) >> 16));
+    } else {
+      bus_.wr16(st + dsQType, 0);                   // sony
+      bus_.wr8(st + dsTwoSideFmt, 0xFF);
+      bus_.wr8(st + dsMFMDrive, 0);
+      bus_.wr8(st + dsMFMDisk, 0);
+    }
     bus_.wr8(st + dsDiskInPlace, im.f ? 1 : 0);
     bus_.wr8(st + dsWriteProt, im.readOnly ? 0xFF : 0);
     d.toMount = index > 0 && im.f;                  // the boot drive is mounted by the boot
-    return num;
+    return (int32_t)((uint32_t)num << 16 | refNum(dce, st, im));
+  }
+
+  // The refNum a drive goes in the queue with: .Sony's (-5), or for a hard disk its own unit-table
+  // entry, a DCE that runs the same code (the calls find the drive by its number). The Mac OS 8
+  // installer will not install on a volume of the floppy driver. The DCE and its master pointer
+  // are in the drive's record (`st` + 32: the pointer, + 36: the DCE), which is never freed.
+  uint16_t refNum(uint32_t dce, uint32_t st, const Image &im) {
+    if (!im.f || im.size <= kFloppyMax) return 0xFFFB;
+    const uint32_t table = bus_.rd32(0x11C);       // UTableBase
+    for (int unit = (int16_t)bus_.rd16(0x1D2) - 1; unit >= 48; unit--) {   // UnitNtryCnt
+      if (bus_.rd32(table + 4 * unit)) continue;
+      const uint32_t h = st + 32, own = st + 36;
+      bus_.wr32(h, own);
+      bus_.wr32(own + dCtlDriver, bus_.rd32(dce + dCtlDriver));
+      bus_.wr16(own + dCtlFlags, (bus_.rd16(dce + dCtlFlags) & 0xFF00) | 0x20);   // opened, in ROM
+      bus_.wr16(own + dCtlQHdr, 3);
+      bus_.wr16(own + dCtlRefNum, (uint16_t)~unit);
+      bus_.wr32(table + 4 * unit, h);
+      return (uint16_t)~unit;
+    }
+    return 0xFFFB;
   }
 
   int32_t prime(uint32_t pb, uint32_t dce) {
@@ -316,10 +369,12 @@ class Drives {
     Drive &d = drive_[i];
     switch (code) {
       case 5: return err(bus_.rd8(d.status + dsDiskInPlace) ? noErr : offLinErr);   // verify
-      case 6: return err(image[i].readOnly ? wPrErr : offLinErr);                     // format
+      case 6: return err(image[i].readOnly ? wPrErr : noErr);   // format: nothing to do (an initialize writes the volume)
       case 7: bus_.wr8(d.status + dsDiskInPlace, 0); return err(noErr);              // eject
       case 8: return err(noErr);                                                      // tag buffer
-      case 23: bus_.wr32(pb + csParam, d.num == 1 ? 0x0004 : 0x0104); return err(noErr);   // drive info
+      case 23:                                      // drive info: a SuperDrive, or a fixed disk (type 1)
+        bus_.wr32(pb + csParam, (image[i].size > kFloppyMax ? 0x0001 : 0x0004) | (d.num == 1 ? 0 : 0x0100));
+        return err(noErr);
     }
     return err(controlErr);
   }
